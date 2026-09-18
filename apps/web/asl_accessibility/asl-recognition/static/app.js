@@ -84,6 +84,16 @@ function hideBanner(id) {
   document.getElementById(id).classList.remove("show");
 }
 
+function setVal(id, value) {
+  // Guards against a page/script version mismatch (e.g. an old index.html
+  // served alongside a newer app.js after only some files got replaced) --
+  // one missing field then shows up as a blank input instead of a crash
+  // that leaves the whole screen stuck.
+  const el = document.getElementById(id);
+  if (el) el.value = value;
+  else console.warn(`setVal: no element #${id} on this page -- is index.html up to date?`);
+}
+
 function isValidUSPhone(value) {
   const digits = (value || "").replace(/\D/g, "");
   return digits.length === 10 || (digits.length === 11 && digits.startsWith("1"));
@@ -220,14 +230,14 @@ async function onUploadContinue() {
 
 function fillProfileVerifyForm() {
   const p = state.profile;
-  document.getElementById("pf_name").value = p.name || "";
-  document.getElementById("pf_phone").value = p.phone || "";
-  document.getElementById("pf_dob").value = p.dob || "";
-  document.getElementById("pf_age").value = p.age || computeAge(p.dob) || "";
-  document.getElementById("pf_address").value = p.address || "";
-  document.getElementById("pf_zipcode").value = p.zipcode || "";
-  document.getElementById("pf_insurance_name").value = p.insurance_name || "";
-  document.getElementById("pf_insurance_id").value = p.insurance_id || "";
+  setVal("pf_name", p.name || "");
+  setVal("pf_phone", p.phone || "");
+  setVal("pf_dob", p.dob || "");
+  setVal("pf_age", p.age || computeAge(p.dob) || "");
+  setVal("pf_address", p.address || "");
+  setVal("pf_zipcode", p.zipcode || "");
+  setVal("pf_insurance_name", p.insurance_name || "");
+  setVal("pf_insurance_id", p.insurance_id || "");
 }
 
 function wireProfileVerify() {
@@ -631,8 +641,15 @@ async function onSubmitBooking() {
 
   showLoading("Sending your request…");
   try {
-    await apiPostJson("/submit-booking", payload);
+    const result = await apiPostJson("/submit-booking", payload);
     hideLoading();
+    const planEl = document.getElementById("donePlan");
+    if (result && result.plan) {
+      document.getElementById("donePlanText").textContent = result.plan;
+      planEl.style.display = "block";
+    } else {
+      planEl.style.display = "none";
+    }
     showScreen("done");
   } catch (e) {
     hideLoading();

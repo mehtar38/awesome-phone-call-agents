@@ -1,0 +1,23 @@
+# Pinned exactly, not a floor -- calle/run.py encodes assumptions about
+# SDK internals (create()'s recipient normalization, the exact fields on
+# the returned dict, wait_for_result()'s narrower-than-documented terminal
+# set) that a minor/patch bump could silently invalidate. Bump deliberately,
+# re-read calle/calls.py in site-packages after bumping, and re-run the
+# three text_harness scenarios before trusting a new version.
+calle-ai==0.7.0
+python-dotenv==1.0.1
+
+# Validates user input against schemas/user_input.schema.json. Pinned so the
+# validator and the committed schema can't drift apart across environments.
+jsonschema==4.23.0
+
+# Used by workflow/clinic_lookup.py to drive the Apify Google Maps Scraper. It
+# arrives transitively with calle-ai today, but this app imports it directly,
+# so it's pinned here rather than left to an SDK bump's discretion.
+httpx==0.28.1
+
+# The HTTP endpoint the frontend POSTs to (api/server.py). uvicorn is the
+# server; fastapi.testclient (backed by the httpx pin above) is what lets the
+# api_endpoint scenario exercise the routes in-process with no network.
+fastapi==0.115.6
+uvicorn==0.32.1

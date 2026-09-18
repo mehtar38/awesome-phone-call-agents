@@ -232,7 +232,7 @@ def _format_phone_e164(raw: str, *, who: str) -> str:
     if len(digits) == 11 and digits.startswith("1"):
         digits = digits[1:]
     if len(digits) != 10:
-        raise ValueError(f"{who}'s phone number needs to be a 10-digit US number")
+        raise ValueError(f"{who} phone number needs to be a 10-digit US number")
     return f"+1{digits}"
 
 
@@ -289,7 +289,7 @@ def submit_booking_endpoint(payload: dict = Body(...)):
             "name": payload["name"],
             "date_of_birth": payload["dob"],
             "age": age,
-            "phone_number": _format_phone_e164(payload["phone"], who="Your"),
+            "phone_number": _format_phone_e164(payload["phone"], who="Your"),  # -> "Your phone number ..."
             "zipcode": payload["zipcode"],
             "appointment_type": payload["clinic_type"],
             "insurance": {
@@ -315,13 +315,17 @@ def submit_booking_endpoint(payload: dict = Body(...)):
                 {
                     "name": m["name"],
                     "relation": m["relation"],
-                    "phone_number": _format_phone_e164(m["phone"], who=m.get("name", "Family member")),
+                    "phone_number": _format_phone_e164(m["phone"], who=f"{m.get('name') or 'Family member'}'s"),
                 }
                 for m in (payload.get("family") or [])
             ]
         except (KeyError, ValueError) as e:
             raise HTTPException(400, str(e))
 
+    # BOOKING_WORKFLOW_URL must point at POST /runs specifically (not just the
+    # host:port) -- that's the one endpoint on the workflow's server that
+    # accepts this JSON body. It returns 202 with a run_id THE WORKFLOW
+    # generates; we never send one ourselves, only get one back.
     body = json.dumps(workflow_payload).encode("utf-8")
     req = urllib.request.Request(
         BOOKING_WORKFLOW_URL, data=body, method="POST",
@@ -331,12 +335,36 @@ def submit_booking_endpoint(payload: dict = Body(...)):
         with urllib.request.urlopen(req, timeout=15) as resp:
             resp_body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")
-        raise HTTPException(502, f"booking workflow rejected the request ({e.code}): {detail[:300]}")
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            reason = json.loads(raw).get("detail", raw)
+        except (json.JSONDecodeError, AttributeError):
+            reason = raw
+        if e.code == 409:
+            # The workflow runs one booking at a time by design (overlapping
+            # runs would place overlapping real phone calls) -- this is an
+            # expected, retryable state, not a bug.
+            raise HTTPException(409, f"A booking is already being processed by the workflow -- try again shortly. ({reason})")
+        raise HTTPException(502, f"booking workflow rejected the request ({e.code}): {reason}"[:400])
     except urllib.error.URLError as e:
-        raise HTTPException(502, f"could not reach the booking workflow: {e.reason}")
+        raise HTTPException(502, f"could not reach the booking workflow at {BOOKING_WORKFLOW_URL}: {e.reason}")
 
-    return {"status": "sent", "workflow_response": resp_body[:2000]}
+    try:
+        run = json.loads(resp_body)
+    except json.JSONDecodeError:
+        return {"status": "sent", "workflow_response": resp_body[:2000]}
+
+    # run_id/plan flow straight back to the confirm screen's result: the plan
+    # text is the actual informed-consent disclosure (per the workflow's own
+    # docs, submitting IS the consent -- there's no second confirm step), so
+    # it needs to reach the user, not just get logged here.
+    return {
+        "status": "sent",
+        "run_id": run.get("run_id"),
+        "run_status": run.get("status"),
+        "mock_mode": run.get("mock_mode"),
+        "plan": run.get("plan"),
+    }
 
 
 # Serves static/index.html at GET / (and any other file under static/).

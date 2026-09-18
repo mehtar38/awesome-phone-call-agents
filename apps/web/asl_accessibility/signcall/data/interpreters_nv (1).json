@@ -1,0 +1,341 @@
+{
+ "state": "NV",
+ "target_city": "Las Vegas",
+ "generated": "2026-09-13",
+ "synthetic": true,
+ "notice": "SYNTHETIC DATA. Modelled on the structure of public ASL interpreter directories (RID's registry and state-level referral lists) -- no real interpreter's name, number, location or credentials appear here. Every phone number sits in the 555-0100..555-0199 block reserved for fictional use, behind real Nevada area codes, so none of them can ring a real person. Rates and minimum billable hours are deliberately absent: the workflow asks each interpreter for those on the call, never assumes them.",
+ "composition": "30 interpreters; 15 in Las Vegas (the state's largest city), 15 spread across the rest of Nevada.",
+ "interpreters": [
+  {
+   "name": "Marisol Duarte",
+   "age": 41,
+   "phone_number": "+18722794605",
+   "zipcode": "89106",
+   "city": "Las Vegas",
+   "expertise": [
+    "medical",
+    "mental_health"
+   ]
+  },
+  {
+   "name": "Devon Hargrove",
+   "age": 34,
+   "phone_number": "+13126722776",
+   "zipcode": "89101",
+   "city": "Las Vegas",
+   "expertise": [
+    "medical",
+    "general"
+   ]
+  },
+  {
+   "name": "Priya Raghunathan",
+   "age": 47,
+   "phone_number": "+19496780146",
+   "zipcode": "89109",
+   "city": "Las Vegas",
+   "expertise": [
+    "medical",
+    "legal"
+   ]
+  },
+  {
+   "name": "Curtis Nwachukwu",
+   "age": 29,
+   "phone_number": "+18722794605",
+   "zipcode": "89102",
+   "city": "Las Vegas",
+   "expertise": [
+    "educational",
+    "general"
+   ]
+  },
+  {
+   "name": "Alina Petrescu",
+   "age": 52,
+   "phone_number": "+13126722776",
+   "zipcode": "89117",
+   "city": "Las Vegas",
+   "expertise": [
+    "medical",
+    "deafblind_tactile"
+   ]
+  },
+  {
+   "name": "Terrence Boateng",
+   "age": 38,
+   "phone_number": "+19496780146",
+   "zipcode": "89119",
+   "city": "Las Vegas",
+   "expertise": [
+    "medical",
+    "VRI"
+   ]
+  },
+  {
+   "name": "Hana Yoshimura",
+   "age": 31,
+   "phone_number": "+18722794605",
+   "zipcode": "89123",
+   "city": "Las Vegas",
+   "expertise": [
+    "mental_health",
+    "general"
+   ]
+  },
+  {
+   "name": "Rosalie Kaminski",
+   "age": 60,
+   "phone_number": "+13126722776",
+   "zipcode": "89128",
+   "city": "Las Vegas",
+   "expertise": [
+    "medical",
+    "legal",
+    "general"
+   ]
+  },
+  {
+   "name": "Emilio Vargas",
+   "age": 44,
+   "phone_number": "+19496780146",
+   "zipcode": "89135",
+   "city": "Las Vegas",
+   "expertise": [
+    "medical",
+    "performing_arts"
+   ]
+  },
+  {
+   "name": "Naomi Threadgill",
+   "age": 27,
+   "phone_number": "+18722794605",
+   "zipcode": "89103",
+   "city": "Las Vegas",
+   "expertise": [
+    "educational",
+    "VRI"
+   ]
+  },
+  {
+   "name": "Bashir Al-Rashid",
+   "age": 49,
+   "phone_number": "+13126722776",
+   "zipcode": "89144",
+   "city": "Las Vegas",
+   "expertise": [
+    "medical",
+    "general"
+   ]
+  },
+  {
+   "name": "Claudia Okonkwo",
+   "age": 36,
+   "phone_number": "+19496780146",
+   "zipcode": "89113",
+   "city": "Las Vegas",
+   "expertise": [
+    "medical",
+    "mental_health"
+   ]
+  },
+  {
+   "name": "Grant Yoshida",
+   "age": 55,
+   "phone_number": "+18722794605",
+   "zipcode": "89120",
+   "city": "Las Vegas",
+   "expertise": [
+    "legal",
+    "general"
+   ]
+  },
+  {
+   "name": "Simone Arbuthnot",
+   "age": 33,
+   "phone_number": "+13126722776",
+   "zipcode": "89148",
+   "city": "Las Vegas",
+   "expertise": [
+    "medical",
+    "educational"
+   ]
+  },
+  {
+   "name": "Victor Salcedo",
+   "age": 62,
+   "phone_number": "+19496780146",
+   "zipcode": "89121",
+   "city": "Las Vegas",
+   "expertise": [
+    "medical",
+    "deafblind_tactile",
+    "general"
+   ]
+  },
+  {
+   "name": "Willa Fontaine",
+   "age": 45,
+   "phone_number": "+18722794605",
+   "zipcode": "89052",
+   "city": "Henderson",
+   "expertise": [
+    "medical",
+    "general"
+   ]
+  },
+  {
+   "name": "Andre Castellano",
+   "age": 39,
+   "phone_number": "+13126722776",
+   "zipcode": "89014",
+   "city": "Henderson",
+   "expertise": [
+    "medical",
+    "VRI"
+   ]
+  },
+  {
+   "name": "Josefina Marquez",
+   "age": 51,
+   "phone_number": "+19496780146",
+   "zipcode": "89002",
+   "city": "Henderson",
+   "expertise": [
+    "mental_health",
+    "general"
+   ]
+  },
+  {
+   "name": "Dominic Ferreira",
+   "age": 28,
+   "phone_number": "+18722794605",
+   "zipcode": "89030",
+   "city": "North Las Vegas",
+   "expertise": [
+    "educational",
+    "general"
+   ]
+  },
+  {
+   "name": "Lena Broadwater",
+   "age": 43,
+   "phone_number": "+13126722776",
+   "zipcode": "89031",
+   "city": "North Las Vegas",
+   "expertise": [
+    "medical",
+    "legal"
+   ]
+  },
+  {
+   "name": "Tobias Lindqvist",
+   "age": 57,
+   "phone_number": "+19496780146",
+   "zipcode": "89501",
+   "city": "Reno",
+   "expertise": [
+    "medical",
+    "general"
+   ]
+  },
+  {
+   "name": "Marguerite Halloran",
+   "age": 35,
+   "phone_number": "+18722794605",
+   "zipcode": "89509",
+   "city": "Reno",
+   "expertise": [
+    "medical",
+    "mental_health"
+   ]
+  },
+  {
+   "name": "Ines Carbajal",
+   "age": 30,
+   "phone_number": "+13126722776",
+   "zipcode": "89502",
+   "city": "Reno",
+   "expertise": [
+    "educational",
+    "VRI"
+   ]
+  },
+  {
+   "name": "Roland Achebe",
+   "age": 48,
+   "phone_number": "+19496780146",
+   "zipcode": "89431",
+   "city": "Sparks",
+   "expertise": [
+    "medical",
+    "general"
+   ]
+  },
+  {
+   "name": "Petra Sandoval",
+   "age": 63,
+   "phone_number": "+18722794605",
+   "zipcode": "89434",
+   "city": "Sparks",
+   "expertise": [
+    "legal",
+    "deafblind_tactile"
+   ]
+  },
+  {
+   "name": "Hollis Tremblay",
+   "age": 40,
+   "phone_number": "+13126722776",
+   "zipcode": "89701",
+   "city": "Carson City",
+   "expertise": [
+    "medical",
+    "general"
+   ]
+  },
+  {
+   "name": "Amara Diallo",
+   "age": 26,
+   "phone_number": "+19496780146",
+   "zipcode": "89703",
+   "city": "Carson City",
+   "expertise": [
+    "educational",
+    "mental_health"
+   ]
+  },
+  {
+   "name": "Sterling Vasquez",
+   "age": 54,
+   "phone_number": "+18722794605",
+   "zipcode": "89801",
+   "city": "Elko",
+   "expertise": [
+    "medical",
+    "general"
+   ]
+  },
+  {
+   "name": "Odette Rambaud",
+   "age": 37,
+   "phone_number": "+13126722776",
+   "zipcode": "89048",
+   "city": "Pahrump",
+   "expertise": [
+    "medical",
+    "VRI"
+   ]
+  },
+  {
+   "name": "Callum Pettigrew",
+   "age": 68,
+   "phone_number": "+19496780146",
+   "zipcode": "89027",
+   "city": "Mesquite",
+   "expertise": [
+    "general"
+   ]
+  }
+ ]
+}

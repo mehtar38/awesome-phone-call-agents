@@ -1,0 +1,440 @@
+{
+ "synthetic": true,
+ "state": "NV",
+ "generated": "2026-09-13",
+ "notice": "SYNTHETIC EMERGENCY FALLBACK. Used by workflow/clinic_lookup.py only when the Apify Google Maps Scraper yields nothing at all (no token, auth or usage-limit error, a failed run, or zero places surviving the filters). These are invented clinics with invented names and reserved 555-01xx phone numbers -- NOT a cached snapshot of real businesses. That is deliberate: a committed file of real clinic names paired with fetched phone numbers risks publishing a real practice's number under the wrong name, and the fallback exists to keep a demo alive, not to be the data. Anything sourced from here is tagged source=\"fallback_snapshot\".",
+ "clinics": {
+  "dental": [
+   {
+    "name": "Fremont Street Dental Care",
+    "phone_number": "+17025550100",
+    "zipcode": "89101",
+    "city": "Las Vegas",
+    "type": "Dentist"
+   },
+   {
+    "name": "Sunridge Family Dentistry",
+    "phone_number": "+17025550101",
+    "zipcode": "89102",
+    "city": "Las Vegas",
+    "type": "Dentist"
+   },
+   {
+    "name": "Red Rock Dental Group",
+    "phone_number": "+17025550102",
+    "zipcode": "89106",
+    "city": "Las Vegas",
+    "type": "Dentist"
+   },
+   {
+    "name": "Paradise Valley Dental",
+    "phone_number": "+17025550103",
+    "zipcode": "89109",
+    "city": "Las Vegas",
+    "type": "Dentist"
+   },
+   {
+    "name": "Silver Mesa Dental Arts",
+    "phone_number": "+17025550104",
+    "zipcode": "89117",
+    "city": "Las Vegas",
+    "type": "Dentist"
+   },
+   {
+    "name": "Desert Bloom Dentistry",
+    "phone_number": "+17025550105",
+    "zipcode": "89119",
+    "city": "Las Vegas",
+    "type": "Dentist"
+   },
+   {
+    "name": "Canyon Gate Dental",
+    "phone_number": "+17025550106",
+    "zipcode": "89123",
+    "city": "Las Vegas",
+    "type": "Dentist"
+   },
+   {
+    "name": "Lone Mountain Family Dental",
+    "phone_number": "+17025550107",
+    "zipcode": "89128",
+    "city": "Las Vegas",
+    "type": "Dentist"
+   },
+   {
+    "name": "Arroyo Dental Studio",
+    "phone_number": "+17025550108",
+    "zipcode": "89135",
+    "city": "Las Vegas",
+    "type": "Dentist"
+   },
+   {
+    "name": "Copper Ridge Dental",
+    "phone_number": "+17025550109",
+    "zipcode": "89144",
+    "city": "Las Vegas",
+    "type": "Dentist"
+   }
+  ],
+  "eyes": [
+   {
+    "name": "Desert Vision Optometry",
+    "phone_number": "+17025550110",
+    "zipcode": "89101",
+    "city": "Las Vegas",
+    "type": "Optometrist"
+   },
+   {
+    "name": "Silver State Eye Care",
+    "phone_number": "+17025550111",
+    "zipcode": "89102",
+    "city": "Las Vegas",
+    "type": "Optometrist"
+   },
+   {
+    "name": "Red Rock Vision Center",
+    "phone_number": "+17255550112",
+    "zipcode": "89106",
+    "city": "Las Vegas",
+    "type": "Optometrist"
+   },
+   {
+    "name": "Sunset Ridge Optometry",
+    "phone_number": "+17025550113",
+    "zipcode": "89109",
+    "city": "Las Vegas",
+    "type": "Optometrist"
+   },
+   {
+    "name": "Canyon Eye Associates",
+    "phone_number": "+17025550114",
+    "zipcode": "89117",
+    "city": "Las Vegas",
+    "type": "Optometrist"
+   },
+   {
+    "name": "Bonneville Vision Clinic",
+    "phone_number": "+17025550115",
+    "zipcode": "89119",
+    "city": "Las Vegas",
+    "type": "Optometrist"
+   },
+   {
+    "name": "Pinyon Eye Care",
+    "phone_number": "+17025550116",
+    "zipcode": "89123",
+    "city": "Las Vegas",
+    "type": "Optometrist"
+   },
+   {
+    "name": "Valley Optical Health",
+    "phone_number": "+17025550117",
+    "zipcode": "89128",
+    "city": "Las Vegas",
+    "type": "Optometrist"
+   },
+   {
+    "name": "Meridian Eye Center",
+    "phone_number": "+17255550118",
+    "zipcode": "89135",
+    "city": "Las Vegas",
+    "type": "Optometrist"
+   },
+   {
+    "name": "Cactus Bloom Optometry",
+    "phone_number": "+17025550119",
+    "zipcode": "89144",
+    "city": "Las Vegas",
+    "type": "Optometrist"
+   }
+  ],
+  "ent": [
+   {
+    "name": "Mojave ENT Associates",
+    "phone_number": "+17025550120",
+    "zipcode": "89101",
+    "city": "Las Vegas",
+    "type": "ENT doctor"
+   },
+   {
+    "name": "Silver State Ear Nose & Throat",
+    "phone_number": "+17025550121",
+    "zipcode": "89102",
+    "city": "Las Vegas",
+    "type": "ENT doctor"
+   },
+   {
+    "name": "Red Rock ENT Clinic",
+    "phone_number": "+17025550122",
+    "zipcode": "89106",
+    "city": "Las Vegas",
+    "type": "ENT doctor"
+   },
+   {
+    "name": "Valley Sinus & Hearing Center",
+    "phone_number": "+17025550123",
+    "zipcode": "89109",
+    "city": "Las Vegas",
+    "type": "ENT doctor"
+   },
+   {
+    "name": "Canyon ENT Specialists",
+    "phone_number": "+17025550124",
+    "zipcode": "89117",
+    "city": "Las Vegas",
+    "type": "ENT doctor"
+   },
+   {
+    "name": "Pahranagat ENT Group",
+    "phone_number": "+17025550125",
+    "zipcode": "89119",
+    "city": "Las Vegas",
+    "type": "ENT doctor"
+   },
+   {
+    "name": "Sierra Sound ENT",
+    "phone_number": "+17025550126",
+    "zipcode": "89123",
+    "city": "Las Vegas",
+    "type": "ENT doctor"
+   },
+   {
+    "name": "Desert Breath ENT Care",
+    "phone_number": "+17025550127",
+    "zipcode": "89128",
+    "city": "Las Vegas",
+    "type": "ENT doctor"
+   },
+   {
+    "name": "Summit Ear & Sinus",
+    "phone_number": "+17025550128",
+    "zipcode": "89135",
+    "city": "Las Vegas",
+    "type": "ENT doctor"
+   },
+   {
+    "name": "Vista ENT Partners",
+    "phone_number": "+17025550129",
+    "zipcode": "89144",
+    "city": "Las Vegas",
+    "type": "ENT doctor"
+   }
+  ],
+  "physical_therapy": [
+   {
+    "name": "Red Rock Physical Therapy",
+    "phone_number": "+17025550130",
+    "zipcode": "89101",
+    "city": "Las Vegas",
+    "type": "Physical therapy clinic"
+   },
+   {
+    "name": "Mojave Motion PT",
+    "phone_number": "+17255550131",
+    "zipcode": "89102",
+    "city": "Las Vegas",
+    "type": "Physical therapy clinic"
+   },
+   {
+    "name": "Silver State Rehab & PT",
+    "phone_number": "+17025550132",
+    "zipcode": "89106",
+    "city": "Las Vegas",
+    "type": "Physical therapy clinic"
+   },
+   {
+    "name": "Canyon Trail Physical Therapy",
+    "phone_number": "+17025550133",
+    "zipcode": "89109",
+    "city": "Las Vegas",
+    "type": "Physical therapy clinic"
+   },
+   {
+    "name": "Desert Stride PT",
+    "phone_number": "+17025550134",
+    "zipcode": "89117",
+    "city": "Las Vegas",
+    "type": "Physical therapy clinic"
+   },
+   {
+    "name": "Valley Range Motion",
+    "phone_number": "+17025550135",
+    "zipcode": "89119",
+    "city": "Las Vegas",
+    "type": "Physical therapy clinic"
+   },
+   {
+    "name": "Sunrise Peak Rehabilitation",
+    "phone_number": "+17025550136",
+    "zipcode": "89123",
+    "city": "Las Vegas",
+    "type": "Physical therapy clinic"
+   },
+   {
+    "name": "Lone Mountain PT Clinic",
+    "phone_number": "+17255550137",
+    "zipcode": "89128",
+    "city": "Las Vegas",
+    "type": "Physical therapy clinic"
+   },
+   {
+    "name": "Arroyo Sports Rehab",
+    "phone_number": "+17025550138",
+    "zipcode": "89135",
+    "city": "Las Vegas",
+    "type": "Physical therapy clinic"
+   },
+   {
+    "name": "Cactus Ridge Physical Therapy",
+    "phone_number": "+17025550139",
+    "zipcode": "89144",
+    "city": "Las Vegas",
+    "type": "Physical therapy clinic"
+   }
+  ],
+  "mental": [
+   {
+    "name": "Desert Calm Behavioral Health",
+    "phone_number": "+17025550140",
+    "zipcode": "89101",
+    "city": "Las Vegas",
+    "type": "Mental health clinic"
+   },
+   {
+    "name": "Silver State Counseling Center",
+    "phone_number": "+17025550141",
+    "zipcode": "89102",
+    "city": "Las Vegas",
+    "type": "Mental health clinic"
+   },
+   {
+    "name": "Red Rock Mental Health Clinic",
+    "phone_number": "+17025550142",
+    "zipcode": "89106",
+    "city": "Las Vegas",
+    "type": "Mental health clinic"
+   },
+   {
+    "name": "Canyon Light Therapy Group",
+    "phone_number": "+17025550143",
+    "zipcode": "89109",
+    "city": "Las Vegas",
+    "type": "Mental health clinic"
+   },
+   {
+    "name": "Valley Mind Wellness",
+    "phone_number": "+17025550144",
+    "zipcode": "89117",
+    "city": "Las Vegas",
+    "type": "Mental health clinic"
+   },
+   {
+    "name": "Sunridge Behavioral Associates",
+    "phone_number": "+17025550145",
+    "zipcode": "89119",
+    "city": "Las Vegas",
+    "type": "Mental health clinic"
+   },
+   {
+    "name": "Meridian Counseling NV",
+    "phone_number": "+17025550146",
+    "zipcode": "89123",
+    "city": "Las Vegas",
+    "type": "Mental health clinic"
+   },
+   {
+    "name": "Sagebrush Mental Health",
+    "phone_number": "+17255550147",
+    "zipcode": "89128",
+    "city": "Las Vegas",
+    "type": "Mental health clinic"
+   },
+   {
+    "name": "Summit Path Psychiatry",
+    "phone_number": "+17025550148",
+    "zipcode": "89135",
+    "city": "Las Vegas",
+    "type": "Mental health clinic"
+   },
+   {
+    "name": "Open Sky Behavioral Care",
+    "phone_number": "+17255550149",
+    "zipcode": "89144",
+    "city": "Las Vegas",
+    "type": "Mental health clinic"
+   }
+  ],
+  "general": [
+   {
+    "name": "Desert Springs Family Medicine",
+    "phone_number": "+17025550150",
+    "zipcode": "89101",
+    "city": "Las Vegas",
+    "type": "Primary care clinic"
+   },
+   {
+    "name": "Silver State Primary Care",
+    "phone_number": "+17025550151",
+    "zipcode": "89102",
+    "city": "Las Vegas",
+    "type": "Primary care clinic"
+   },
+   {
+    "name": "Red Rock Family Health",
+    "phone_number": "+17025550152",
+    "zipcode": "89106",
+    "city": "Las Vegas",
+    "type": "Primary care clinic"
+   },
+   {
+    "name": "Canyon Gate Medical Group",
+    "phone_number": "+17255550153",
+    "zipcode": "89109",
+    "city": "Las Vegas",
+    "type": "Primary care clinic"
+   },
+   {
+    "name": "Valley Care Clinic",
+    "phone_number": "+17025550154",
+    "zipcode": "89117",
+    "city": "Las Vegas",
+    "type": "Primary care clinic"
+   },
+   {
+    "name": "Sunrise Family Practice",
+    "phone_number": "+17025550155",
+    "zipcode": "89119",
+    "city": "Las Vegas",
+    "type": "Primary care clinic"
+   },
+   {
+    "name": "Lone Mountain Primary Care",
+    "phone_number": "+17025550156",
+    "zipcode": "89123",
+    "city": "Las Vegas",
+    "type": "Primary care clinic"
+   },
+   {
+    "name": "Arroyo Health Center",
+    "phone_number": "+17025550157",
+    "zipcode": "89128",
+    "city": "Las Vegas",
+    "type": "Primary care clinic"
+   },
+   {
+    "name": "Copper Ridge Family Medicine",
+    "phone_number": "+17025550158",
+    "zipcode": "89135",
+    "city": "Las Vegas",
+    "type": "Primary care clinic"
+   },
+   {
+    "name": "Vista Primary Care",
+    "phone_number": "+17025550159",
+    "zipcode": "89144",
+    "city": "Las Vegas",
+    "type": "Primary care clinic"
+   }
+  ]
+ }
+}

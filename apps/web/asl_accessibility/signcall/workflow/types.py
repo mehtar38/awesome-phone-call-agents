@@ -73,6 +73,7 @@ class FamilyInterpreter:
     # "YYYY-MM-DD HH:MM" strings -- same contract as
     # InterpreterCandidate.coverable_slots below.
     coverable_slots: list[str] = field(default_factory=list)
+    notes: str | None = None  # concerns they raised on the call, if any
 
 
 @dataclass
@@ -94,9 +95,6 @@ class UserInput:
                                        # contact details are collected for that
                                        # person, so nothing calls or texts them.
     family: list[FamilyInterpreter] = field(default_factory=list)
-    # Days from today to the furthest availability date. Derived, not supplied
-    # -- it's what the clinic is asked to search within.
-    window_days: int = 1
 
     def patient_summary(self) -> str:
         """What the booking call is allowed to give the clinic. The clinic
@@ -132,6 +130,10 @@ class ClinicCandidate:
     source: str = "apify_google_maps"  # "apify_google_maps" | "fallback_snapshot" | "injected"
     accepts_insurance: bool | None = None
     offered_slots: list[ClinicSlot] = field(default_factory=list)
+    # What the clinic said is needed to book or attend (a referral, ID, forms).
+    # Informational: it never changes which clinic is chosen.
+    requirements: list[str] = field(default_factory=list)
+    notes: str | None = None
 
 
 @dataclass
@@ -159,6 +161,7 @@ class InterpreterCandidate:
     # was booked for Thursday because nothing downstream ever checked which
     # slot she'd actually agreed to.
     coverable_slots: list[str] = field(default_factory=list)
+    notes: str | None = None  # concerns they raised on the call, if any
 
     def total_cost(self) -> float | None:
         return (
@@ -191,6 +194,26 @@ class AppointmentResult:
     interpreter_source: str  # "family" | "freelance" | "user_arranged"
     cancellation_deadline: str | None
     evidence: list[str] = field(default_factory=list)
+    # Things the clinic said are required for the appointment (a referral,
+    # ID, forms) -- for the user to act on. Never blocks a booking by itself.
+    requirements: list[str] = field(default_factory=list)
+    # Other concerns raised on any call, each prefixed with who said it.
+    notes: list[str] = field(default_factory=list)
+
+
+def clean_strings(raw: object) -> list[str]:
+    """The non-blank strings in a list a call returned, ignoring anything
+    malformed."""
+    if not isinstance(raw, list):
+        return []
+    return [item.strip() for item in raw if isinstance(item, str) and item.strip()]
+
+
+def append_note(current: "str | None", new: object) -> "str | None":
+    """Adds a note a call returned, ignoring blanks and non-strings."""
+    if not isinstance(new, str) or not new.strip():
+        return current
+    return f"{current}; {new.strip()}" if current else new.strip()
 
 
 def distance_sort_key(distance_miles: float | None) -> tuple[bool, float]:

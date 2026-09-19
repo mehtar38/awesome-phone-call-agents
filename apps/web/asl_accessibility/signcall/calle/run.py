@@ -1,11 +1,8 @@
 """
-Placing calls for real. Everything internal to the workflow (Phase 1
-discover, Phase 3 fan-out, Phase 4 book/confirm) goes through
+Placing calls for real. Everything internal to the workflow goes through
 `call_and_wait()` here -- it's the only function in this package that
-actually reaches CALL-E's API once the top-level consent gate (calle/plan.py)
-has been satisfied. No separate `run_call()` step exists anymore -- see
-plan.py's docstring for why: there's no SDK/REST "run a previously planned
-call" endpoint to call.
+actually reaches CALL-E's API. There is no separate plan/run step: the SDK's
+`calls.create()` creates and dispatches a call in a single request.
 
 Real-mode setup:
     pip install calle-ai              # requires Python >= 3.11
@@ -34,11 +31,26 @@ case-insensitive terminal set instead.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Callable
 
 from . import MOCK_MODE
+
+
+class CallPurpose(str, Enum):
+    """What a call is for. Mock resolvers dispatch on this, never on the
+    wording of the task, so a prompt can be rewritten without breaking them."""
+
+    CLINIC_SEARCH = "clinic_search"
+    CLINIC_BOOK = "clinic_book"
+    CLINIC_CANCEL = "clinic_cancel"
+    FAMILY_AVAILABILITY = "family_availability"
+    INTERPRETER_AVAILABILITY = "interpreter_availability"
+    INTERPRETER_CONFIRM = "interpreter_confirm"
+    INTERPRETER_RELEASE = "interpreter_release"
 
 # Sourced from CALL-E's CLI documentation (references/commands.md, in the
 # `calle` skill) as of 2026-09-12, normalized to uppercase since the
@@ -84,25 +96,27 @@ class CallResult:
 
 
 _client = None  # lazily constructed real CalleClient, real mode only
+_client_lock = threading.Lock()
 
 
 def _get_client():
     global _client
-    if _client is None:
-        import calle as calle_sdk  # the REAL SDK -- resolvable because this
-                                     # app is invoked as `signcall.*`, never
-                                     # with apps/signcall/ itself on sys.path
-                                     # (see README for the naming-collision
-                                     # note and the correct run command)
-        api_key = os.environ.get("CALLE_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "CALLE_API_KEY is not set. Get one from your CALL-E account "
-                "dashboard (this is separate from the CLI's browser login) "
-                "and `export CALLE_API_KEY=...` before running in real mode."
-            )
-        _client = calle_sdk.CalleClient(api_key=api_key)
-    return _client
+    with _client_lock:  # calls can start on several threads at once
+        if _client is None:
+            import calle as calle_sdk  # the REAL SDK -- resolvable because this
+                                         # app is invoked as `signcall.*`, never
+                                         # with apps/signcall/ itself on sys.path
+                                         # (see README for the naming-collision
+                                         # note and the correct run command)
+            api_key = os.environ.get("CALLE_API_KEY")
+            if not api_key:
+                raise RuntimeError(
+                    "CALLE_API_KEY is not set. Get one from your CALL-E account "
+                    "dashboard (this is separate from the CLI's browser login) "
+                    "and `export CALLE_API_KEY=...` before running in real mode."
+                )
+            _client = calle_sdk.CalleClient(api_key=api_key)
+        return _client
 
 
 def _extract_confidence(raw_value) -> float:
@@ -161,22 +175,37 @@ def _poll_until_terminal(client, call_id: str, timeout_seconds: float = 600.0) -
 
 # --- Demo call routing (REAL mode only) ---------------------------------
 #
-# Hard rule for this build: a real call may ring ONLY one of the three test
-# lines below, all owned by the project's own user. Clinic numbers are real
-# (clinic_lookup fetches them from Google Maps via Apify) and roster numbers are
-# synthetic; neither is ever dialed. The logical recipient still drives the
-# task text, the mock lookup, and the evidence trail -- only the number the
-# SDK is handed is substituted.
+# Clinics and freelance interpreters are only ever rung on one of the three
+# test lines below, all owned by the project's own user. Clinic numbers are
+# real (clinic_lookup fetches them from Google Maps via Apify) and roster
+# numbers are synthetic; neither is ever dialed. The logical recipient still
+# drives the task text, the mock lookup, and the evidence trail -- only the
+# number the SDK is handed is substituted.
+#
+# Family calls are the exception: those numbers were entered by the user in
+# their own profile, so they are dialed as given (see resolve_call_target).
 #
 # Recipients are assigned a line by their POSITION within the group being
-# worked through (a batch of 3 clinics or interpreters; the index within the
-# family list), and the assignment is STICKY: the clinic searched on line 2
-# is booked on line 2, and an interpreter confirmed on line 3 was asked on
-# line 3.
+# worked through (the clinic list, or a batch of 3 interpreters), and the
+# assignment is STICKY: the clinic searched on line 2 is booked on line 2, and
+# an interpreter confirmed on line 3 was asked on line 3.
 
-DEMO_TEST_LINES = ("+18722794605", "+13126722776", "+19496780146")
+DEMO_TEST_LINES = ("+18722794605", "+17168683628", "+19496780146")
 
 _line_assignments: dict[str, str] = {}
+_routing_lock = threading.Lock()
+
+# A phone can't take two calls at once, so calls to the same number queue while
+# calls to different numbers run in parallel. This matters here because the
+# whole roster shares the three test lines, so two candidates in one parallel
+# batch can resolve to the same line.
+_dial_locks: dict[str, threading.Lock] = {}
+_dial_locks_guard = threading.Lock()
+
+
+def _dial_lock(dial_target: str) -> threading.Lock:
+    with _dial_locks_guard:
+        return _dial_locks.setdefault(dial_target, threading.Lock())
 
 
 class CallRoutingError(RuntimeError):
@@ -188,7 +217,8 @@ class CallRoutingError(RuntimeError):
 def reset_call_routing() -> None:
     """Called at the top of every run. Without this, a second run in the same
     process inherits the first run's line assignments."""
-    _line_assignments.clear()
+    with _routing_lock:
+        _line_assignments.clear()
 
 
 def resolve_dial_target(logical_phone: str, batch_position: int | None = None) -> str:
@@ -198,24 +228,36 @@ def resolve_dial_target(logical_phone: str, batch_position: int | None = None) -
 
     Never returns `logical_phone`: the result is always a DEMO_TEST_LINES
     entry."""
-    assigned = _line_assignments.get(logical_phone)
-    if assigned is not None:
-        return assigned  # stickiness wins over position
-    if batch_position is None:
-        raise CallRoutingError(
-            f"No test line assigned for {logical_phone!r} and no batch_position "
-            f"given. Every call site must pass its index within the group it's "
-            f"calling (batch of 3, or family list index) the first time it "
-            f"reaches a recipient -- refusing to guess a line."
-        )
-    line = DEMO_TEST_LINES[batch_position % len(DEMO_TEST_LINES)]
-    _line_assignments[logical_phone] = line
-    return line
+    with _routing_lock:
+        assigned = _line_assignments.get(logical_phone)
+        if assigned is not None:
+            return assigned  # stickiness wins over position
+        if batch_position is None:
+            raise CallRoutingError(
+                f"No test line assigned for {logical_phone!r} and no batch_position "
+                f"given. Every call site must pass its index within the group it's "
+                f"calling (clinic list, family list or interpreter batch) the first "
+                f"time it reaches a recipient -- refusing to guess a line."
+            )
+        line = DEMO_TEST_LINES[batch_position % len(DEMO_TEST_LINES)]
+        _line_assignments[logical_phone] = line
+        return line
+
+
+def resolve_call_target(
+    logical_phone: str, purpose: CallPurpose, batch_position: int | None = None
+) -> str:
+    """The number a real-mode call actually dials. A family call rings the
+    family member's own number, exactly as the user entered it in their
+    profile. Every other call goes to a test line (see resolve_dial_target)."""
+    if purpose is CallPurpose.FAMILY_AVAILABILITY:
+        return logical_phone
+    return resolve_dial_target(logical_phone, batch_position)
 
 
 # --- Mock mode plumbing (unchanged) -------------------------------------
 
-MockResolver = Callable[[str, str], CallResult]  # (task, phone) -> CallResult
+MockResolver = Callable[[str, str, CallPurpose], CallResult]  # (task, phone, purpose)
 
 _mock_resolvers: dict[str, MockResolver] = {}
 
@@ -259,20 +301,26 @@ def call_and_wait(
     phone: str,
     result_schema: dict | None = None,
     batch_position: int | None = None,
+    *,
+    purpose: CallPurpose,
 ) -> CallResult:
     """
     The one function everything in workflow/ actually calls.
 
-    `phone` is the LOGICAL recipient -- the clinic or interpreter this call is
-    about. In mock mode it selects the scripted response. In real mode it is
-    NOT dialed: resolve_dial_target() maps it onto one of the three owned test
-    lines, so a real rehearsal can never ring a real clinic. `batch_position`
+    `phone` is the LOGICAL recipient -- the clinic, interpreter or family
+    member this call is about. In mock mode it selects the scripted response.
+    In real mode, for a clinic or interpreter it is NOT dialed:
+    resolve_call_target() maps it onto one of the owned test lines, so a real
+    rehearsal can never ring a real clinic. A family call dials the family
+    member's own number. `batch_position`
     is the recipient's index within the group being called and is required the
     first time a given recipient is reached.
 
+    `purpose` says what the call is for; mock resolvers dispatch on it.
+
     Real mode places an actual phone call and blocks until it reaches a
-    terminal status. Only call this after the user has confirmed the plan via
-    calle.plan.render_plan_for_user().
+    terminal status. Safe to call from several threads at once: calls to
+    different numbers run in parallel, calls to the same number queue.
     """
     if MOCK_MODE:
         resolver = _mock_resolvers.get(phone) or _default_mock
@@ -282,15 +330,16 @@ def call_and_wait(
                 f"calle.run.register_mock({phone!r}, ...) in your test "
                 f"harness before exercising this path."
             )
-        return resolver(task, phone)
+        return resolver(task, phone, purpose)
 
     client = _get_client()
-    dial_target = resolve_dial_target(phone, batch_position)
-    created = client.calls.create(
-        task=task,
-        recipient={"phone": dial_target},
-        result_schema=result_schema,
-    )
-    call_id = str(created["id"])
-    final = _poll_until_terminal(client, call_id)
+    dial_target = resolve_call_target(phone, purpose, batch_position)
+    with _dial_lock(dial_target):
+        created = client.calls.create(
+            task=task,
+            recipient={"phone": dial_target},
+            result_schema=result_schema,
+        )
+        call_id = str(created["id"])
+        final = _poll_until_terminal(client, call_id)
     return _map_result(final)

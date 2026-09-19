@@ -10,8 +10,8 @@ What the schema can't express, and this module checks, is everything that
 would otherwise fail several real, paid calls deep:
 
   - the named weekday must actually be that date's weekday
-  - no availability date may be in the past (the search horizon is derived
-    from the furthest one; a past date asks a clinic about "the next -3 days")
+  - no availability date may be in the past (no clinic can book a time that
+    has already gone)
   - the ZIP must be inside this build's Nevada data (the clinic-distance
     centroid table and the interpreter roster are NV-scoped)
 
@@ -110,7 +110,6 @@ def load_user_input(obj: dict, today: "datetime | None" = None) -> UserInput:
         )
 
     windows: list[TimeWindow] = []
-    furthest = today_date
     for entry in obj["availability"]:
         try:
             date = datetime.strptime(entry["date"], "%Y-%m-%d")
@@ -125,15 +124,12 @@ def load_user_input(obj: dict, today: "datetime | None" = None) -> UserInput:
             )
         if date < today_date:
             raise UserInputError(
-                f"Availability date {entry['date']} is in the past. The clinic "
-                f"search window is derived from the furthest availability date, "
-                f"so a past date would ask clinics about a window that has "
-                f"already closed."
+                f"Availability date {entry['date']} is in the past, so no "
+                f"clinic could book it."
             )
         hour, minute = parse_slot_time(entry["time"])
         start = date.replace(hour=hour, minute=minute)
         windows.append(TimeWindow(start, start + timedelta(hours=SLOT_HOURS)))
-        furthest = max(furthest, date)
 
     family = [
         FamilyInterpreter(
@@ -156,7 +152,6 @@ def load_user_input(obj: dict, today: "datetime | None" = None) -> UserInput:
         free_windows=windows,
         has_interpreter=obj["has_interpreter"],
         family=family,
-        window_days=max(1, (furthest - today_date).days),
     )
 
 

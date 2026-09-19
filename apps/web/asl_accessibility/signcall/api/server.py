@@ -1,9 +1,14 @@
 """
 The endpoint the frontend POSTs to.
 
-    POST /runs          -> 202 {run_id, status, mock_mode, plan}
-    GET  /runs/{id}     -> {status, result | error, plan, started_at, finished_at}
-    GET  /health        -> {mock_mode, real_calls_allowed, credentials present}
+    POST /runs               -> 202 {run_id, status, mock_mode, plan}
+    GET  /runs/{id}          -> {status, proposal, result | error | reason, plan,
+                                 started_at, finished_at}
+    POST /runs/{id}/confirm  -> the user's answer: {"approved": true | false}
+    GET  /health             -> {mock_mode, real_calls_allowed, credentials present}
+
+A run's status is running -> awaiting_confirmation -> running -> one of
+succeeded | declined | failed.
 
 Shape of the contract, and why:
 
@@ -14,10 +19,13 @@ Shape of the contract, and why:
   - A real run places roughly fifteen phone calls and takes many minutes, so
     an accepted run is handed to a background thread and the caller polls.
     Holding an HTTP connection open across that would time out in any browser.
-  - Submission is the consent: there is no second confirm step. The plan text
-    returned by POST is the same text workflow/appointment.py::describe_goal()
-    produces -- including the disclosure that the booking call gives the
-    clinic the patient's name, date of birth and insurance details.
+  - Submission consents to the SEARCH: the plan text returned by POST is
+    workflow/appointment.py::describe_goal(), including what each kind of call
+    shares. Nothing is BOOKED until a second answer: once a clinic slot and an
+    interpreter are lined up, the run pauses in awaiting_confirmation with a
+    `proposal`, tells the user (api/notify.py), and waits for POST .../confirm.
+    No answer within SIGNCALL_CONFIRM_TIMEOUT_SECONDS (default 900) counts as
+    "no", and the run ends as declined.
 
 Run it (from apps/, never from apps/signcall/ -- see README's naming-collision
 note):
@@ -42,17 +50,19 @@ from datetime import datetime
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, StrictBool
 
 from ..calle import MOCK_MODE
-from ..calle.plan import create_plan
 from ..calle.run import clear_default_mock, register_default_mock
 from ..workflow.appointment import describe_goal, run_interpreter_mesh
+from ..workflow.confirmation import ApprovalFn, BookingDeclined, BookingProposal
 from ..workflow.types import UserInput
 from ..workflow.user_input import UserInputError, load_user_input
-from . import demo_mocks
+from . import demo_mocks, notify
 
 ALLOW_REAL_CALLS = os.environ.get("SIGNCALL_API_ALLOW_REAL_CALLS") == "1"
 USE_DEMO_MOCKS = os.environ.get("SIGNCALL_API_DEMO_MOCKS") == "1"
+CONFIRM_TIMEOUT_SECONDS = float(os.environ.get("SIGNCALL_CONFIRM_TIMEOUT_SECONDS", "900"))
 
 # CORS is NOT a security boundary here -- see the README. It stops another
 # site's JavaScript reading responses; it stops nothing from POSTing.
@@ -74,13 +84,29 @@ app.add_middleware(
 # mock registry are module-level globals, and run_interpreter_mesh() clears the
 # former at the start of every run -- so two overlapping runs would erase each
 # other's test-line assignments, and the booking call (which relies on a sticky
-# assignment made during the clinic search) would fail AFTER an interpreter had
-# already committed. That is exactly the fee-bearing window this project
-# documents. The lock is what stands between them.
+# assignment made during the clinic search) would fail after the user had
+# approved it. The lock is what stands between them, and it is held while a
+# run waits for the user's answer.
 _run_lock = threading.Lock()
 _runs: dict[str, dict] = {}
 _runs_guard = threading.Lock()
 _active_run_id: str | None = None
+
+
+@dataclasses.dataclass
+class _Decision:
+    """The user's answer to a pending confirmation, handed from the request
+    thread that received it to the run thread that is waiting on it."""
+
+    answered: threading.Event = dataclasses.field(default_factory=threading.Event)
+    approved: bool = False
+
+
+_decisions: dict[str, _Decision] = {}
+
+
+class ConfirmRequest(BaseModel):
+    approved: StrictBool
 
 
 def _assert_mode_is_deliberate() -> None:
@@ -112,6 +138,49 @@ def _record(run_id: str, **fields) -> None:
         _runs[run_id].update(fields)
 
 
+def _finish(run_id: str, **fields) -> None:
+    """Records how a run ended, then tells whoever is listening."""
+    _record(run_id, finished_at=_now(), **fields)
+    notify.send_event({
+        "event": "run_finished",
+        "run_id": run_id,
+        "status": fields["status"],
+        "result": fields.get("result"),
+        "error": fields.get("error"),
+        "reason": fields.get("reason"),
+    })
+
+
+def _approver(run_id: str) -> ApprovalFn:
+    """The approval callback for one run: publish the proposal, tell the user,
+    and hold the run thread until they answer or the timeout passes."""
+
+    def approve(proposal: BookingProposal) -> bool:
+        decision = _Decision()
+        proposal_data = dataclasses.asdict(proposal)
+        with _runs_guard:
+            _decisions[run_id] = decision
+            _runs[run_id].update(status="awaiting_confirmation", proposal=proposal_data)
+        notify.send_event({
+            "event": "confirmation_requested", "run_id": run_id, "proposal": proposal_data,
+        })
+
+        decision.answered.wait(timeout=CONFIRM_TIMEOUT_SECONDS)
+        with _runs_guard:
+            _decisions.pop(run_id, None)
+            # An answer can land between the wait timing out and this lock;
+            # it was set under the same lock, so it is visible here.
+            answered = decision.answered.is_set()
+        if not answered:
+            raise BookingDeclined(
+                f"No answer within {CONFIRM_TIMEOUT_SECONDS:g} seconds, so "
+                f"nothing was booked."
+            )
+        return decision.approved
+
+    return approve
+
+
 def _execute(run_id: str, user: UserInput, gate: "threading.Event | None") -> None:
     """The background worker. Everything the workflow can raise is recorded as
     a failed run rather than escaping -- the HTTP response was sent long ago,
@@ -120,13 +189,15 @@ def _execute(run_id: str, user: UserInput, gate: "threading.Event | None") -> No
     try:
         if USE_DEMO_MOCKS:
             register_default_mock(demo_mocks.build_resolver(user, gate))
-        result = run_interpreter_mesh(user, confirm_with_user=False)
+        result = run_interpreter_mesh(user, approve=_approver(run_id))
+    except BookingDeclined as exc:
+        _finish(run_id, status="declined", reason=str(exc))
     except Exception as exc:
-        _record(run_id, status="failed", error=str(exc),
-                error_type=type(exc).__name__, finished_at=_now())
+        # Some exceptions (a timeout, for one) have an empty message.
+        _finish(run_id, status="failed", error=str(exc) or type(exc).__name__,
+                error_type=type(exc).__name__)
     else:
-        _record(run_id, status="succeeded", result=dataclasses.asdict(result),
-                finished_at=_now())
+        _finish(run_id, status="succeeded", result=dataclasses.asdict(result))
     finally:
         if USE_DEMO_MOCKS:
             clear_default_mock()
@@ -142,6 +213,7 @@ def health() -> dict:
         "mock_mode": MOCK_MODE,
         "real_calls_allowed": ALLOW_REAL_CALLS and not MOCK_MODE,
         "demo_mocks": USE_DEMO_MOCKS,
+        "notify_url_configured": bool(os.environ.get("SIGNCALL_NOTIFY_URL")),        "confirm_timeout_seconds": CONFIRM_TIMEOUT_SECONDS,
         # Presence only -- never the values.
         "calle_api_key_present": bool(os.environ.get("CALLE_API_KEY")),
         "apify_api_token_present": bool(os.environ.get("APIFY_API_TOKEN")),
@@ -179,12 +251,13 @@ async def start_run(request: Request) -> JSONResponse:
         )
 
     run_id = str(uuid.uuid4())
-    plan = create_plan(goal=describe_goal(user)).goal_text
+    plan = describe_goal(user)
     with _runs_guard:
         _runs[run_id] = {
             "run_id": run_id, "status": "running", "plan": plan,
             "mock_mode": MOCK_MODE, "started_at": _now(), "finished_at": None,
-            "result": None, "error": None, "error_type": None,
+            "proposal": None, "result": None, "error": None, "error_type": None,
+            "reason": None,
         }
     _active_run_id = run_id
 
@@ -209,6 +282,27 @@ def get_run(run_id: str) -> dict:
     if run is None:
         raise HTTPException(status_code=404, detail=f"No run with id {run_id}.")
     return run
+
+
+@app.post("/runs/{run_id}/confirm")
+def confirm_run(run_id: str, body: ConfirmRequest) -> dict:
+    """The user's answer to a run that is awaiting_confirmation. Answering an
+    unknown run is 404; answering one that isn't waiting (already answered,
+    timed out, or finished) is 409, so a double-click can't decide twice."""
+    with _runs_guard:
+        run = _runs.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"No run with id {run_id}.")
+        decision = _decisions.get(run_id)
+        if run["status"] != "awaiting_confirmation" or decision is None or decision.answered.is_set():
+            raise HTTPException(
+                status_code=409,
+                detail=f"Run {run_id} is not waiting for an answer (status: {run['status']}).",
+            )
+        decision.approved = body.approved
+        run["status"] = "running"
+        decision.answered.set()
+    return {"run_id": run_id, "status": "running", "approved": body.approved}
 
 
 # Test-only hook: the harness pushes a threading.Event here to hold the next

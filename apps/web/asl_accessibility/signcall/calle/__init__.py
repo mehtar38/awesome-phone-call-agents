@@ -18,15 +18,9 @@ agent wants to place ad hoc test calls conversationally -- but that's not
 this workflow. REST is the fallback only if the SDK is ever missing
 something (e.g. a specific webhook shape).
 
-Two pieces, matching two different points in the workflow -- corrected
-from an earlier draft that assumed a plan/confirm/run split existed at
-the SDK level (it doesn't; see plan.py's docstring for why):
-
-  plan.py               -- the accessibility consent gate. Pure local
-      logic, zero network calls. Used exactly ONCE per user intent, at
-      the top of appointment.py: the plan is rendered back to the Deaf
-      user (text + gloss playback) and nothing below reaches CALL-E
-      until they approve it.
+There is no plan/confirm/run split at the SDK level: `calls.create()`
+creates AND dispatches a call in one request, so consent is handled by the
+caller (see api/server.py), not here.
 
   call_and_wait() in run.py  -- the ONLY function in this package that
       actually calls CALL-E. Deliberately does NOT use the SDK's own
@@ -37,10 +31,8 @@ the SDK level (it doesn't; see plan.py's docstring for why):
       call that goes to voicemail silently polls for a full 10-minute
       timeout instead of returning promptly. call_and_wait() does its own
       polling against the fuller, case-insensitive terminal set instead.
-      Used for every call the workflow makes after the top-level
-      approval above (clinic search, family, interpreter batches, book) --
-      these don't re-confirm with the user each time, since they're all part
-      of the run already approved once. In REAL mode call_and_wait() also
+      Used for every call the workflow makes (clinic search, family,
+      interpreter batches, book). In REAL mode call_and_wait() also
       routes every one of them onto the three owned demo test lines; see
       DEMO_TEST_LINES / resolve_dial_target() in run.py.
 

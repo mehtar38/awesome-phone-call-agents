@@ -356,3 +356,32 @@ canvas#captureCanvas { display: none; }
 .confirm-icon svg { width: 30px; height: 30px; }
 .confirm-title { text-align: center; font-family: var(--font-display); font-size: 1.4rem; font-weight: 600; margin-bottom: 8px; }
 .confirm-sub { text-align: center; color: var(--text-muted); margin-bottom: 24px; }
+
+/* ---------- workflow progress / approval / outcome ---------- */
+[hidden] { display: none !important; }
+
+.status-block {
+  display: flex; flex-direction: column; align-items: center; text-align: center;
+  margin: 8vh 0 28px;
+}
+.status-block .spinner { margin-bottom: 20px; }
+.status-block .hint { margin-bottom: 0; }
+
+.confirm-icon .icon-stop { display: none; }
+.confirm-icon[data-kind="stop"] { background: var(--danger-tint); color: var(--danger); }
+.confirm-icon[data-kind="stop"] .icon-ok { display: none; }
+.confirm-icon[data-kind="stop"] .icon-stop { display: block; }
+
+/* A box for things the user should read: what the clinic requires, and any
+   concerns raised on the calls. */
+.notice {
+  background: var(--accent-tint); border-left: 3px solid var(--accent);
+  border-radius: var(--radius-sm); padding: 14px 16px; margin: 16px 0;
+}
+.notice-muted { background: var(--surface-sunken); border-left-color: var(--border-strong); }
+.notice-title {
+  font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-muted); margin-bottom: 8px;
+}
+.notice ul { margin: 0; padding-left: 18px; line-height: 1.5; }
+.notice li + li { margin-top: 4px; }

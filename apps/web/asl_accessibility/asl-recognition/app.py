@@ -38,7 +38,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import Body, FastAPI, File, HTTPException, Path as PathParam, UploadFile, WebSocket, WebSocketDisconnect
+from dotenv import load_dotenv
+from fastapi import Body, FastAPI, File, HTTPException, Path as PathParam, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -47,6 +48,11 @@ from gemini_client import extract_card_fields, parse_booking_transcript
 from infer import classify_features, predict
 from segmenter import SignSegmenter
 from utils_landmarks import Landmarkers
+
+# Settings live in asl-recognition/.env (see .env.example), read from this
+# file's own folder so it doesn't matter where the server is started from.
+# Variables already set in the shell win over the file.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # Where the completed booking request is forwarded -- the clinic/interpreter
 # matching workflow (calling clinics, checking interpreter availability,
@@ -265,9 +271,9 @@ def _weekday_name(date_str: str) -> str:
 def submit_booking_endpoint(payload: dict = Body(...)):
     """Takes the confirm screen's payload (our own internal field names),
     reshapes it into the exact JSON schema the booking workflow expects, and
-    forwards it there over HTTP. Nothing is persisted locally -- there's no
-    "past bookings" screen in this app, so a local copy would just be dead
-    data; the workflow is the system of record from here on."""
+    forwards it there over HTTP. The request itself isn't kept -- only the
+    run's id and progress, so the confirmation and outcome screens can find
+    it again (see db.py's bookings table and the /bookings endpoints)."""
     if not BOOKING_WORKFLOW_URL:
         raise HTTPException(500, "BOOKING_WORKFLOW_URL is not set on the server")
 
@@ -354,10 +360,15 @@ def submit_booking_endpoint(payload: dict = Body(...)):
     except json.JSONDecodeError:
         return {"status": "sent", "workflow_response": resp_body[:2000]}
 
+    # Tie the run to this browser. The workflow reports progress by run id
+    # alone, and the browser only ever asks for runs it owns.
+    if run.get("run_id"):
+        db.register_booking(run["run_id"], payload["user_id"])
+
     # run_id/plan flow straight back to the confirm screen's result: the plan
-    # text is the actual informed-consent disclosure (per the workflow's own
-    # docs, submitting IS the consent -- there's no second confirm step), so
-    # it needs to reach the user, not just get logged here.
+    # text is the informed-consent disclosure for the search (nothing is
+    # booked until the user approves a proposal later), so it needs to reach
+    # the user, not just get logged here.
     return {
         "status": "sent",
         "run_id": run.get("run_id"),
@@ -365,6 +376,122 @@ def submit_booking_endpoint(payload: dict = Body(...)):
         "mock_mode": run.get("mock_mode"),
         "plan": run.get("plan"),
     }
+
+
+def _workflow_url(*parts: str) -> str:
+    """BOOKING_WORKFLOW_URL is the workflow's POST /runs; a run's own
+    endpoints hang off it."""
+    return "/".join([BOOKING_WORKFLOW_URL.rstrip("/"), *parts])
+
+
+def _booking_for(run_id: str, user_id) -> dict:
+    """The booking, if it exists AND belongs to this browser. Anything else is
+    the same 404, so a run id on its own reveals nothing."""
+    booking = db.get_booking(run_id)
+    if booking is None or not user_id or booking["user_id"] != user_id:
+        raise HTTPException(404, "No such booking.")
+    return booking
+
+
+def _sync_from_workflow(booking: dict) -> dict:
+    """Notifications are how this server normally learns a run's state, but
+    they can be lost: the workflow was started without SIGNCALL_NOTIFY_URL, or
+    this server was down when one was sent. While a run is unfinished, ask the
+    workflow directly, so a lost notification can't leave the page waiting
+    forever. Best effort -- any failure just leaves the stored state as it is."""
+    if booking["status"] not in ("running", "awaiting_confirmation") or not BOOKING_WORKFLOW_URL:
+        return booking
+    try:
+        with urllib.request.urlopen(_workflow_url(booking["run_id"]), timeout=5) as resp:
+            run = json.loads(resp.read().decode("utf-8"))
+    except (OSError, ValueError):  # unreachable, HTTP error, or not JSON
+        return booking
+
+    status = run.get("status")
+    if status == "awaiting_confirmation" and isinstance(run.get("proposal"), dict):
+        db.record_proposal(booking["run_id"], run["proposal"])
+    elif status in ("succeeded", "declined", "failed"):
+        db.record_outcome(
+            booking["run_id"], status,
+            result=run.get("result"), error=run.get("error"), reason=run.get("reason"),
+        )
+    else:
+        return booking
+    return db.get_booking(booking["run_id"])
+
+
+@app.post("/notifications")
+def receive_notification_endpoint(payload: dict = Body(...)):
+    """Where the booking workflow delivers its events (its SIGNCALL_NOTIFY_URL
+    points here). This is the "notification" to the user: it is stored, and
+    the open browser page shows it. There are no accounts yet, so it can't
+    be a text or email -- and, for the same reason, nothing authenticates the
+    sender beyond the run id being unguessable.
+
+    Events, from the workflow's api/notify.py:
+      confirmation_requested  {run_id, proposal}
+      run_finished            {run_id, status, result, error, reason}"""
+    run_id = payload.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise HTTPException(400, "run_id is required")
+
+    event = payload.get("event")
+    if event == "confirmation_requested":
+        proposal = payload.get("proposal")
+        if not isinstance(proposal, dict):
+            raise HTTPException(400, "proposal must be an object")
+        db.record_proposal(run_id, proposal)
+    elif event == "run_finished":
+        status = payload.get("status")
+        if status not in ("succeeded", "declined", "failed"):
+            raise HTTPException(400, f"unknown run status {status!r}")
+        db.record_outcome(
+            run_id, status,
+            result=payload.get("result"), error=payload.get("error"), reason=payload.get("reason"),
+        )
+    else:
+        raise HTTPException(400, f"unknown event {event!r}")
+    return {"status": "received"}
+
+
+@app.get("/bookings/{run_id}")
+def get_booking_endpoint(run_id: str, user_id: str = Query(...)):
+    """What the progress / confirm / outcome screens poll. `status` is one of
+    running, awaiting_confirmation, succeeded, declined, failed."""
+    booking = _sync_from_workflow(_booking_for(run_id, user_id))
+    return {key: booking[key] for key in ("run_id", "status", "proposal", "result", "error", "reason")}
+
+
+@app.post("/bookings/{run_id}/confirm")
+def confirm_booking_endpoint(run_id: str, payload: dict = Body(...)):
+    """The user's yes or no to the proposal on screen. Forwarded to the
+    workflow, which is waiting on it; nothing is booked before this."""
+    approved = payload.get("approved")
+    if not isinstance(approved, bool):
+        raise HTTPException(400, "approved must be true or false")
+    booking = _booking_for(run_id, payload.get("user_id"))
+    if booking["status"] != "awaiting_confirmation":
+        raise HTTPException(409, "This request is no longer waiting for your answer.")
+    if not BOOKING_WORKFLOW_URL:
+        raise HTTPException(500, "BOOKING_WORKFLOW_URL is not set on the server")
+
+    req = urllib.request.Request(
+        _workflow_url(run_id, "confirm"), data=json.dumps({"approved": approved}).encode("utf-8"),
+        method="POST", headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15):
+            pass
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            # Answered already, or the workflow gave up waiting and ended it.
+            raise HTTPException(409, "This request is no longer waiting for your answer -- it may have timed out.")
+        raise HTTPException(502, f"booking workflow rejected your answer ({e.code})")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"could not reach the booking workflow at {BOOKING_WORKFLOW_URL}: {e.reason}")
+
+    db.resolve_confirmation(run_id, approved)
+    return {"status": "running" if approved else "declined"}
 
 
 # Serves static/index.html at GET / (and any other file under static/).

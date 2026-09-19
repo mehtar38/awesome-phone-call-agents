@@ -2,30 +2,31 @@
 Step 3B: freelance interpreter sourcing, and the binding confirm.
 
 This is a SATISFICING batch search,
-not a global optimization: candidates are called in batches of 3 against the
-already-matched clinic slots, each also asked their hourly rate, and the
+not a global optimization: candidates are called in batches of 3 -- all three
+at the same time -- against the already-matched clinic slots, each also asked
+their hourly rate, and the
 search stops at the first batch with at least one match. "Cheapest" is only
 ever a comparison within that batch -- two runs against the same pool can
 book different people depending on batch order. That's the documented trade
 for call-budget control.
 
-Note on ordering (changed, deliberately): this module's organizing principle
-used to be that the clinic leg was booked first because it's freely
-cancelable, with the interpreter asked to commit exactly once afterwards. The
-finalized sequence inverts it -- the interpreter confirms first, and the
-clinic is called back to book afterwards. confirm_interpreter() is still the
-single binding ask, but it now happens against a slot that is matched rather
-than already booked. See the "Flagged tension" callout in CALL-E Hackathon
-Ideas.md; the risk is accepted, not resolved.
+Ordering: confirm_interpreter() is the single binding ask, and it happens last
+-- after the user has approved the appointment and the clinic slot is booked.
 """
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from ..calle.run import call_and_wait
+from ..calle.run import CallPurpose, call_and_wait
 
 from .clinic_lookup import zip_distance_miles
-from .types import ClinicSlot, InterpreterCandidate, distance_sort_key
+from .types import ClinicSlot, InterpreterCandidate, append_note, distance_sort_key
+
+_NOTES_FIELD = {
+    "type": "string",
+    "description": "Any concern or condition they raised. Empty if none.",
+}
 
 ROSTER_PATH = Path(__file__).resolve().parent.parent / "data" / "interpreters_nv.json"
 
@@ -35,12 +36,13 @@ INTERPRETER_AVAILABILITY_SCHEMA = {
         "coverable_slots": {"type": "array", "items": {"type": "string"}},
         "rate_per_hour": {"type": "number"},
         "minimum_hours": {"type": "number"},
+        "additional_notes": _NOTES_FIELD,
     },
 }
 
 INTERPRETER_CONFIRM_SCHEMA = {
     "type": "object",
-    "properties": {"confirmed": {"type": "boolean"}},
+    "properties": {"confirmed": {"type": "boolean"}, "additional_notes": _NOTES_FIELD},
 }
 
 
@@ -113,21 +115,14 @@ def _ask_availability_and_rate(
         f"hourly rate and their minimum billable hours for the visit. This "
         f"is an availability check only -- do not book or place a hold."
     )
-    # task = (
-    #     f"Tell that you are calling on behalf of {name} Ask this ASL interpreter whether "
-    #     f"they're available for any of "
-    #     f"these appointment times: {', '.join(slot_keys)}. Return every one "
-    #     f"of those times they can cover, each written back exactly as given "
-    #     f"(YYYY-MM-DD HH:MM). If they can cover any of them, also get their "
-    #     f"hourly rate and their minimum billable hours for the visit. This "
-    #     f"is an availability check only -- do not book or place a hold."
-    # )
 
     result = call_and_wait(
-        task, candidate.phone, INTERPRETER_AVAILABILITY_SCHEMA, batch_position=batch_position
+        task, candidate.phone, INTERPRETER_AVAILABILITY_SCHEMA,
+        batch_position=batch_position, purpose=CallPurpose.INTERPRETER_AVAILABILITY,
     )
     if not result.task_completed:
         return False  # no answer / declined to engage at all
+    candidate.notes = append_note(candidate.notes, result.structured_result.get("additional_notes"))
     raw = result.structured_result.get("coverable_slots") or []
     coverable = [s for s in raw if isinstance(s, str) and s in slot_keys]
     if not coverable:
@@ -165,21 +160,30 @@ def search_freelancers_in_batches(
 ) -> list[InterpreterCandidate]:
     """
     Step 3B. Calls candidates `batch_size` at a time against the matched
-    slots. The whole batch is called before evaluating it, because the
-    cheapest-by-rate comparison is within the batch. The first batch with at
-    least one match ends the search -- no further interpreters are called --
-    and its matches come back sorted cheapest-first.
+    slots, the whole batch in parallel: the cheapest-by-rate comparison is
+    within the batch, so every answer is needed, and nothing is gained by
+    waiting on one before dialling the next. The first batch with at least
+    one match ends the search -- no further interpreters are called -- and its
+    matches come back sorted cheapest-first, however the answers arrived.
+
+    An exception on any call ends the search with that exception, as it would
+    if the calls ran one after another.
     """
     if not matched_slots:
         return []
     slot_keys = [s.key() for s in matched_slots]
     for start in range(0, len(candidates), batch_size):
         batch = candidates[start : start + batch_size]
-        matches = [
-            c
-            for position, c in enumerate(batch)
-            if _ask_availability_and_rate(c, slot_keys, batch_position=position)
-        ]
+        with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+            answers = list(
+                pool.map(
+                    lambda item: _ask_availability_and_rate(
+                        item[1], slot_keys, batch_position=item[0]
+                    ),
+                    enumerate(batch),
+                )
+            )
+        matches = [candidate for candidate, matched in zip(batch, answers) if matched]
         if matches:
             return rank_by_rate(matches)
     return []
@@ -219,23 +223,29 @@ def confirm_interpreter(candidate: InterpreterCandidate, slot: ClinicSlot) -> bo
     asked non-bindingly during the batch search; this is a live yes/no on
     the specific slot and price.
 
-    Under the finalized sequence this happens BEFORE the clinic slot is
-    actually booked -- see the module docstring.
+    This happens after the user has approved and the clinic slot is booked --
+    see the module docstring.
     """
     task = (
         f"Call this interpreter back and confirm: can they do "
         f"{slot.date} {slot.time} at ${candidate.rate_per_hour}/hr, "
         f"{candidate.minimum_hours}hr minimum? Get a clear yes or no."
     )
-    result = call_and_wait(task, candidate.phone, INTERPRETER_CONFIRM_SCHEMA)  # sticky line
+    result = call_and_wait(
+        task, candidate.phone, INTERPRETER_CONFIRM_SCHEMA,
+        purpose=CallPurpose.INTERPRETER_CONFIRM,  # sticky line
+    )
+    candidate.notes = append_note(candidate.notes, result.structured_result.get("additional_notes"))
     return bool(result.structured_result.get("confirmed", False))
 
 
 def send_release(candidate: InterpreterCandidate, reason: str) -> None:
     """Rare reversal only: the clinic booking fell through after this
     interpreter already said yes. A genuine engagement existed, so this is a
-    real release, not a no-op. STILL UNWIRED -- nothing calls it, including
-    the Step 4 booking failure that the finalized sequence makes possible.
-    That gap is documented, not accidental."""
+    real release, not a no-op. Currently unreferenced: the clinic is booked
+    before any interpreter commits, so nothing reaches this state today."""
     task = f"Call this interpreter and let them know the appointment was cancelled: {reason}."
-    call_and_wait(task, candidate.phone, {"type": "object"}, batch_position=0)
+    call_and_wait(
+        task, candidate.phone, {"type": "object"},
+        batch_position=0, purpose=CallPurpose.INTERPRETER_RELEASE,
+    )

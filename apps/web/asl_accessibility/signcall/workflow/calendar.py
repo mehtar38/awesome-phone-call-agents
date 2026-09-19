@@ -18,6 +18,20 @@ from __future__ import annotations
 from .types import ClinicSlot, TimeWindow
 
 
+def describe_windows(windows: list[TimeWindow]) -> str:
+    """The user's free windows as text a voice agent can say, e.g.
+    'Thursday, September 24, between 2:00 PM and 3:00 PM'. Built by hand
+    rather than with %-d / %-I, which Windows' strftime doesn't support."""
+
+    def clock(moment) -> str:
+        return f"{moment.hour % 12 or 12}:{moment.minute:02d} {'AM' if moment.hour < 12 else 'PM'}"
+
+    return "; ".join(
+        f"{w.start:%A, %B} {w.start.day}, between {clock(w.start)} and {clock(w.end)}"
+        for w in windows
+    )
+
+
 def slot_in_windows(slot: ClinicSlot, windows: list[TimeWindow]) -> bool:
     """A clinic slot is a single point in time (date + time), not a
     window -- it's "in" a set of free windows if any of them contains it."""

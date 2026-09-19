@@ -181,17 +181,64 @@
     </div>
   </section>
 
-  <!-- ================= DONE ================= -->
-  <section id="done" class="screen">
-    <div style="margin-top:15vh;">
-      <div class="confirm-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M8.2 12.3l2.4 2.4L15.8 9"/></svg></div>
-      <div class="confirm-title">Request sent</div>
-      <p class="confirm-sub">We'll text you once it's confirmed.</p>
-      <div id="donePlan" class="field" style="display:none;">
-        <label>What we told the clinic</label>
-        <p class="hint" id="donePlanText" style="margin:0;"></p>
-      </div>
+  <!-- ================= PROGRESS (WORKFLOW RUNNING) ================= -->
+  <section id="progress" class="screen">
+    <div class="status-block">
+      <div class="spinner"></div>
+      <h1 id="progressTitle">Finding your appointment</h1>
+      <p class="hint" id="progressText" role="status" aria-live="polite"></p>
     </div>
+    <div class="field">
+      <label>What we're doing</label>
+      <p class="hint" id="progressPlanText" style="margin:0;"></p>
+    </div>
+  </section>
+
+  <!-- ================= CONFIRM (YOUR GO / NO-GO) ================= -->
+  <section id="confirm" class="screen">
+    <h1>Approve this appointment?</h1>
+    <p class="hint">Nothing is booked until you say yes.</p>
+    <div id="confirmError" class="banner error" role="alert"></div>
+
+    <div id="confirmDetails"></div>
+
+    <div id="confirmRequirements" class="notice" hidden>
+      <div class="notice-title">Required for this appointment</div>
+      <ul id="confirmRequirementsList"></ul>
+    </div>
+    <div id="confirmNotes" class="notice notice-muted" hidden>
+      <div class="notice-title">Also mentioned on the calls</div>
+      <ul id="confirmNotesList"></ul>
+    </div>
+
+    <div class="actions">
+      <button id="btnApprove" class="btn btn-primary">Yes, book it</button>
+      <button id="btnDecline" class="btn btn-danger">No, don't book</button>
+    </div>
+  </section>
+
+  <!-- ================= DONE (BOOKED / NOT BOOKED / COULDN'T FINISH) ================= -->
+  <section id="done" class="screen">
+    <div class="status-block">
+      <div class="confirm-icon" id="doneIcon" data-kind="ok">
+        <svg class="icon-ok" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M8.2 12.3l2.4 2.4L15.8 9"/></svg>
+        <svg class="icon-stop" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M9 9l6 6M15 9l-6 6"/></svg>
+      </div>
+      <div class="confirm-title" id="doneTitle"></div>
+      <p class="confirm-sub" id="doneSub"></p>
+    </div>
+
+    <div id="doneDetails"></div>
+
+    <div id="doneRequirements" class="notice" hidden>
+      <div class="notice-title">Required for this appointment</div>
+      <ul id="doneRequirementsList"></ul>
+    </div>
+    <div id="doneNotes" class="notice notice-muted" hidden>
+      <div class="notice-title">Also mentioned on the calls</div>
+      <ul id="doneNotesList"></ul>
+    </div>
+
     <div class="actions">
       <button id="btnBookAnother" class="btn btn-primary">Book something else</button>
     </div>

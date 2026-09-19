@@ -148,6 +148,7 @@ async function init() {
       const complete = state.profile.name && state.profile.phone && state.profile.dob
         && state.profile.insurance_name && state.profile.insurance_id && state.profile.zipcode;
       if (complete) {
+        if (await resumeActiveRun()) return;
         showScreen("inputMethod");
         return;
       }
@@ -643,14 +644,11 @@ async function onSubmitBooking() {
   try {
     const result = await apiPostJson("/submit-booking", payload);
     hideLoading();
-    const planEl = document.getElementById("donePlan");
-    if (result && result.plan) {
-      document.getElementById("donePlanText").textContent = result.plan;
-      planEl.style.display = "block";
+    if (result && result.run_id) {
+      startTracking(result.run_id, result.plan || "");
     } else {
-      planEl.style.display = "none";
+      showOutcome({ status: "sent" });
     }
-    showScreen("done");
   } catch (e) {
     hideLoading();
     // Surface the server's actual reason (e.g. a specific bad field) instead
@@ -659,10 +657,234 @@ async function onSubmitBooking() {
   }
 }
 
+// ------------------------------------------- workflow progress / approval --
+//
+// After a request is sent, the booking workflow runs for minutes and reports
+// back through the server (see app.py's /notifications). This section follows
+// one run: a progress screen while it works, a confirm screen when it needs
+// the user's go/no-go, and an outcome screen when it ends. Statuses, as the
+// server reports them: running, awaiting_confirmation, succeeded, declined,
+// failed.
+
+const POLL_INTERVAL_MS = 2000;
+const ACTIVE_RUN_KEY = "aslapp_active_run";
+const APP_TITLE = document.title;
+
+const tracking = { id: null, timer: null, failures: 0, screen: null, answered: false, declinedByUser: false };
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+// Everything the workflow reports (clinic names, notes taken from phone
+// calls) is untrusted text, so it is only ever set as textContent.
+function fillRows(container, rows) {
+  container.replaceChildren(...rows.map(([label, value]) => {
+    const row = el("div", "review-row");
+    row.append(el("span", "k", label), el("span", "v", value));
+    return row;
+  }));
+}
+
+function fillList(box, list, items) {
+  list.replaceChildren(...items.map((item) => el("li", "", item)));
+  box.hidden = items.length === 0;
+}
+
+function formatWhen(date, time) {
+  const when = new Date(`${date}T${time}`);
+  if (isNaN(when)) return `${date} ${time}`;
+  return when.toLocaleString(undefined, { weekday: "long", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+function describeInterpreter(interpreter) {
+  if (!interpreter || interpreter.tier === "user_arranged") return "Your own interpreter";
+  if (interpreter.tier === "family") return `${interpreter.name} (${interpreter.relation})`;
+  const minimum = interpreter.minimum_hours != null ? `, ${interpreter.minimum_hours} hr minimum` : "";
+  const total = interpreter.total_estimate != null ? ` (about $${interpreter.total_estimate})` : "";
+  return `${interpreter.name}: $${interpreter.rate_per_hour}/hr${minimum}${total}`;
+}
+
+function startTracking(runId, plan) {
+  stopTracking();
+  Object.assign(tracking, { id: runId, failures: 0, screen: null, answered: false, declinedByUser: false });
+  try { localStorage.setItem(ACTIVE_RUN_KEY, runId); } catch (e) { /* private mode: tracking just won't survive a refresh */ }
+  document.getElementById("progressPlanText").textContent = plan;
+  showProgress(
+    "Finding your appointment",
+    "Calling clinics and interpreters. This can take a few minutes. Keep this page open -- we'll ask you before anything is booked.",
+  );
+  pollBooking();
+  tracking.timer = setInterval(pollBooking, POLL_INTERVAL_MS);
+}
+
+function stopTracking() {
+  if (tracking.timer) clearInterval(tracking.timer);
+  tracking.timer = null;
+}
+
+function forgetRun() {
+  stopTracking();
+  tracking.id = null;
+  try { localStorage.removeItem(ACTIVE_RUN_KEY); } catch (e) { /* nothing to clear */ }
+}
+
+async function fetchBooking(runId) {
+  return apiGet(`/bookings/${encodeURIComponent(runId)}?user_id=${encodeURIComponent(state.userId)}`);
+}
+
+async function pollBooking() {
+  const runId = tracking.id;
+  if (!runId) return;
+  let booking;
+  try {
+    booking = await fetchBooking(runId);
+  } catch (e) {
+    tracking.failures += 1;
+    if (tracking.failures >= 3 && tracking.screen === "progress") {
+      document.getElementById("progressText").textContent = "Having trouble reaching the server. Still trying...";
+    }
+    return;
+  }
+  if (tracking.id !== runId) return;  // a newer run took over while this was in flight
+  tracking.failures = 0;
+
+  if (booking.status === "awaiting_confirmation") {
+    // Once answered, ignore a stale poll that still says "awaiting".
+    if (!tracking.answered && tracking.screen !== "confirm") showConfirm(booking.proposal);
+  } else if (booking.status !== "running") {
+    forgetRun();
+    showOutcome(booking);
+  }
+}
+
+function showProgress(title, text) {
+  document.title = APP_TITLE;
+  document.getElementById("progressTitle").textContent = title;
+  document.getElementById("progressText").textContent = text;
+  tracking.screen = "progress";
+  showScreen("progress");
+}
+
+function setConfirmButtons(enabled) {
+  document.getElementById("btnApprove").disabled = !enabled;
+  document.getElementById("btnDecline").disabled = !enabled;
+}
+
+function showConfirm(proposal) {
+  const distance = proposal.clinic_distance_miles != null ? `, ${proposal.clinic_distance_miles} mi away` : "";
+  const rows = [
+    ["Clinic", `${proposal.clinic_name} (${proposal.clinic_zipcode}${distance})`],
+    ["When", formatWhen(proposal.date, proposal.time)],
+    ["Interpreter", describeInterpreter(proposal.interpreter)],
+  ];
+  if (proposal.alternates && proposal.alternates.length) {
+    rows.push(["If they decline", proposal.alternates.map(describeInterpreter).join("; ")]);
+  }
+  fillRows(document.getElementById("confirmDetails"), rows);
+  fillList(document.getElementById("confirmRequirements"), document.getElementById("confirmRequirementsList"), proposal.requirements || []);
+  fillList(document.getElementById("confirmNotes"), document.getElementById("confirmNotesList"), proposal.notes || []);
+  hideBanner("confirmError");
+  setConfirmButtons(true);
+  document.title = `Action needed - ${APP_TITLE}`;
+  tracking.screen = "confirm";
+  showScreen("confirm");
+}
+
+async function answerProposal(approved) {
+  if (!tracking.id) return;
+  setConfirmButtons(false);
+  hideBanner("confirmError");
+  tracking.answered = true;
+  tracking.declinedByUser = !approved;
+  try {
+    await apiPostJson(`/bookings/${encodeURIComponent(tracking.id)}/confirm`, { user_id: state.userId, approved });
+  } catch (e) {
+    tracking.answered = false;
+    tracking.declinedByUser = false;
+    showBanner("confirmError", e.message || "Couldn't send your answer -- please try again.");
+    setConfirmButtons(true);
+    return;
+  }
+  if (approved) {
+    showProgress("Booking your appointment", "Calling the clinic to book, then confirming your interpreter.");
+  } else {
+    pollBooking();
+  }
+}
+
+function showOutcome(booking) {
+  document.title = APP_TITLE;
+  const proposal = booking.proposal;
+  const result = booking.result;
+  let title = "Request sent";
+  let sub = "We'll text you once it's confirmed.";
+  let kind = "ok";
+  let rows = [];
+
+  if (booking.status === "succeeded") {
+    title = "Appointment booked";
+    sub = proposal ? `${proposal.clinic_name}, ${formatWhen(proposal.date, proposal.time)}` : "Your appointment is booked.";
+    const appointment = (result && result.appointment) || {};
+    if (appointment.booking_reference) rows.push(["Booking reference", appointment.booking_reference]);
+    if (appointment.confirmed_by) rows.push(["Confirmed by", appointment.confirmed_by]);
+    if (result && result.interpreter) rows.push(["Interpreter", describeInterpreter(result.interpreter)]);
+  } else if (booking.status === "declined") {
+    title = "Nothing was booked";
+    sub = tracking.declinedByUser
+      ? "You chose not to book this appointment."
+      : (booking.reason || "This request was not approved.");
+    kind = "stop";
+  } else if (booking.status === "failed") {
+    title = "We couldn't finish this";
+    sub = booking.error || "Something went wrong while booking.";
+    kind = "stop";
+  }
+
+  document.getElementById("doneTitle").textContent = title;
+  document.getElementById("doneSub").textContent = sub;
+  document.getElementById("doneIcon").dataset.kind = kind;
+  fillRows(document.getElementById("doneDetails"), rows);
+  fillList(document.getElementById("doneRequirements"), document.getElementById("doneRequirementsList"), (result && result.requirements) || []);
+  fillList(document.getElementById("doneNotes"), document.getElementById("doneNotesList"), (result && result.notes) || []);
+  tracking.screen = "done";
+  showScreen("done");
+}
+
+// A refresh mid-run shouldn't lose the request: pick it back up, or show how
+// it ended while the page was closed. Returns whether it took over the screen.
+async function resumeActiveRun() {
+  let runId = null;
+  try { runId = localStorage.getItem(ACTIVE_RUN_KEY); } catch (e) { /* storage unavailable */ }
+  if (!runId) return false;
+  try {
+    const booking = await fetchBooking(runId);
+    if (booking.status === "running" || booking.status === "awaiting_confirmation") {
+      startTracking(runId, "");
+    } else {
+      forgetRun();
+      showOutcome(booking);
+    }
+    return true;
+  } catch (e) {
+    forgetRun();  // unknown to this server, or it can't be reached
+    return false;
+  }
+}
+
+function wireConfirm() {
+  document.getElementById("btnApprove").addEventListener("click", () => answerProposal(true));
+  document.getElementById("btnDecline").addEventListener("click", () => answerProposal(false));
+}
+
 // --------------------------------------------------------------- done --
 
 function wireDone() {
   document.getElementById("btnBookAnother").addEventListener("click", () => {
+    forgetRun();
     state.transcript = ""; words = [];
     document.getElementById("typedInput").value = "";
     renderTranscript();
@@ -681,6 +903,7 @@ function wireUpAll() {
   wireFamilyVerify();
   wireInputMethod();
   wireBookingConfirm();
+  wireConfirm();
   wireDone();
 }
 

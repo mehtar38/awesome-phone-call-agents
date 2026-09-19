@@ -18,9 +18,11 @@ def confirmation_text_body(
     clinic_name: str,
     slot: ClinicSlot,
     interpreter_name: str | None = None,
+    requirements: list[str] | None = None,
 ) -> str:
-    """The Step 4 confirmation message, shared by both recipients so the
-    user and the secured interpreter are told exactly the same thing.
+    """The Step 4 confirmation message. The user and the secured interpreter
+    are told the same thing, except that only the user is given
+    `requirements` -- what the clinic said is needed for the appointment.
 
     `interpreter_name` is None when the user brought their own interpreter:
     no contact details are collected for that person, so there's nobody for
@@ -29,9 +31,12 @@ def confirmation_text_body(
     interpreter_line = (
         f" ASL interpreter: {interpreter_name}." if interpreter_name else ""
     )
+    requirements_line = (
+        f" Required for the appointment: {'; '.join(requirements)}." if requirements else ""
+    )
     return (
         f"{recipient_name}: appointment confirmed at {clinic_name} on "
-        f"{slot.date} at {slot.time}.{interpreter_line}"
+        f"{slot.date} at {slot.time}.{interpreter_line}{requirements_line}"
     )
 
 

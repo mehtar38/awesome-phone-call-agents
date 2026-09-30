@@ -79,6 +79,31 @@ def build_resolver(user: UserInput, gate: "threading.Event | None" = None):
             # Declining keeps the demo on the freelance path, which is the
             # fuller sequence.
             return _ok({"coverable_slots": []})
+        if purpose is CallPurpose.FAMILY_CONFIRM:
+            # Unreachable in this scripted run (family never locks in above),
+            # kept for completeness so a future script change doesn't KeyError.
+            return _ok({"confirmed": True})
+        if purpose in (CallPurpose.INTERPRETER_RELEASE, CallPurpose.FAMILY_RELEASE):
+            # cancel_appointment()'s release calls -- nothing to return, they
+            # don't read structured_result at all.
+            return _ok({})
         return _ok({})
+
+    return resolver
+
+
+def build_cancel_resolver():
+    """Scripted answers for cancel_appointment()'s calls, registered by
+    api/server.py's _execute_cancel() the same way build_resolver() above is
+    registered by _execute(). A separate, simpler resolver rather than
+    reusing build_resolver(): a cancellation can run long after the
+    original UserInput object is gone (see cancel_appointment()'s
+    docstring), and CLINIC_CANCEL/INTERPRETER_RELEASE/FAMILY_RELEASE never
+    need calendar-aware answers the way the original booking calls do."""
+
+    def resolver(task: str, phone: str, purpose: CallPurpose) -> CallResult:
+        if purpose is CallPurpose.CLINIC_CANCEL:
+            return _ok({"cancelled": True})
+        return _ok({})  # INTERPRETER_RELEASE / FAMILY_RELEASE read nothing back
 
     return resolver

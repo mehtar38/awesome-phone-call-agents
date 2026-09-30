@@ -5,10 +5,12 @@ The endpoint the frontend POSTs to.
     GET  /runs/{id}          -> {status, proposal, result | error | reason, plan,
                                  started_at, finished_at}
     POST /runs/{id}/confirm  -> the user's answer: {"approved": true | false}
+    POST /runs/{id}/cancel   -> 202, cancels an already-succeeded booking
     GET  /health             -> {mock_mode, real_calls_allowed, credentials present}
 
 A run's status is running -> awaiting_confirmation -> running -> one of
-succeeded | declined | failed.
+succeeded | declined | failed. A succeeded run can move on once more, only on
+the user's own request: succeeded -> cancelling -> cancelled | cancel_failed.
 
 Shape of the contract, and why:
 
@@ -54,7 +56,7 @@ from pydantic import BaseModel, StrictBool
 
 from ..calle import MOCK_MODE
 from ..calle.run import clear_default_mock, register_default_mock
-from ..workflow.appointment import describe_goal, run_interpreter_mesh
+from ..workflow.appointment import cancel_appointment, describe_goal, run_interpreter_mesh
 from ..workflow.confirmation import ApprovalFn, BookingDeclined, BookingProposal
 from ..workflow.types import UserInput
 from ..workflow.user_input import UserInputError, load_user_input
@@ -257,7 +259,12 @@ async def start_run(request: Request) -> JSONResponse:
             "run_id": run_id, "status": "running", "plan": plan,
             "mock_mode": MOCK_MODE, "started_at": _now(), "finished_at": None,
             "proposal": None, "result": None, "error": None, "error_type": None,
-            "reason": None,
+            "reason": None, "cancellation": None,
+            # Leading underscore = never returned by get_run() (see there) --
+            # this is PII with no reason to leave the process, kept only so a
+            # later cancel_appointment() call has the patient's name without
+            # needing this UserInput object to still exist.
+            "_patient_name": user.name,
         }
     _active_run_id = run_id
 
@@ -281,7 +288,11 @@ def get_run(run_id: str) -> dict:
         run = _runs.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"No run with id {run_id}.")
-    return run
+    # Leading-underscore keys are internal bookkeeping (see start_run()) --
+    # never returned, on principle: nothing is exposed here that isn't meant
+    # to leave the process, and a run_id alone is the only "auth" this
+    # endpoint has.
+    return {key: value for key, value in run.items() if not key.startswith("_")}
 
 
 @app.post("/runs/{run_id}/confirm")
@@ -303,6 +314,91 @@ def confirm_run(run_id: str, body: ConfirmRequest) -> dict:
         run["status"] = "running"
         decision.answered.set()
     return {"run_id": run_id, "status": "running", "approved": body.approved}
+
+
+def _execute_cancel(run_id: str) -> None:
+    """The background worker for a cancel request -- mirrors _execute()
+    above: cancel_appointment() places real calls (clinic, then whoever was
+    interpreting), so this runs off the request thread the same way the
+    original booking run did, and the lock it holds is the SAME one, for the
+    SAME reason -- a cancellation places calls through the same real-mode
+    routing/dial-lock machinery a fresh POST /runs would, and the two must
+    never overlap."""
+    global _active_run_id
+    try:
+        if USE_DEMO_MOCKS:
+            # A fresh, simpler resolver, not a reuse of the original run's --
+            # that one was already cleared in _execute()'s finally block once
+            # this run succeeded, and it closed over a UserInput this run may
+            # not have anymore anyway (see demo_mocks.build_cancel_resolver()).
+            register_default_mock(demo_mocks.build_cancel_resolver())
+        with _runs_guard:
+            result = _runs[run_id]["result"]
+            patient_name = _runs[run_id]["_patient_name"]
+        cancellation = cancel_appointment(result, patient_name)
+    except Exception as exc:
+        _record(
+            run_id, status="cancel_failed", finished_at=_now(),
+            error=str(exc) or type(exc).__name__, error_type=type(exc).__name__,
+        )
+        notify.send_event({
+            "event": "run_cancelled", "run_id": run_id, "status": "cancel_failed",
+            "error": str(exc) or type(exc).__name__,
+        })
+    else:
+        _record(run_id, status="cancelled", finished_at=_now(), cancellation=cancellation)
+        notify.send_event({
+            "event": "run_cancelled", "run_id": run_id, "status": "cancelled",
+            "cancellation": cancellation,
+        })
+    finally:
+        if USE_DEMO_MOCKS:
+            clear_default_mock()
+        _active_run_id = None
+        _run_lock.release()  # in finally, for the same reason as _execute()'s
+
+
+@app.post("/runs/{run_id}/cancel", status_code=202)
+def cancel_run(run_id: str) -> JSONResponse:
+    """Cancels an already-succeeded booking: calls the clinic to cancel,
+    then releases whoever was lined up to interpret it. Valid from
+    `succeeded`, and retriable from `cancel_failed` (nothing about a failed
+    cancel attempt un-books the appointment, so trying again is exactly
+    what should happen) -- refused from any other status, and refused while
+    a cancellation is already in flight, the same way a second confirm
+    answer is."""
+    global _active_run_id
+
+    with _runs_guard:
+        run = _runs.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"No run with id {run_id}.")
+        if run["status"] not in ("succeeded", "cancel_failed"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Run {run_id} has nothing to cancel right now (status: {run['status']}).",
+            )
+
+    if not _run_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A run is already in progress (run_id={_active_run_id}). "
+                f"Cancellation places real calls through the same routing as "
+                f"a booking run, so it has to wait its turn too."
+            ),
+        )
+
+    with _runs_guard:
+        run["status"] = "cancelling"
+    _active_run_id = run_id
+
+    threading.Thread(
+        target=_execute_cancel, args=(run_id,), name=f"signcall-cancel-{run_id[:8]}",
+        daemon=False,
+    ).start()
+
+    return JSONResponse(status_code=202, content={"run_id": run_id, "status": "cancelling"})
 
 
 # Test-only hook: the harness pushes a threading.Event here to hold the next

@@ -70,12 +70,32 @@ def _reset() -> None:
     PROPOSALS.clear()
 
 
+def _force_parallel_batch(on: bool) -> bool:
+    """PARALLEL_BATCH_CALLS defaults to OFF (sequential dispatch) in
+    production -- see interpreter_matching's module docstring -- but
+    scenario_freelance_parallel exists specifically to prove the PARALLEL
+    dispatch path still works when it's turned on. It forces this here and
+    restores it with _restore_parallel_batch() before returning. Not
+    reentrant/thread-safe, but every scenario in this file runs in its own
+    fresh process (see the module docstring's run instructions), so nothing
+    here ever overlaps."""
+    old = interpreter_matching.PARALLEL_BATCH_CALLS
+    interpreter_matching.PARALLEL_BATCH_CALLS = on
+    return old
+
+
+def _restore_parallel_batch(old: bool) -> None:
+    interpreter_matching.PARALLEL_BATCH_CALLS = old
+
+
 def _is_booking(purpose: CallPurpose) -> bool:
     return purpose is CallPurpose.CLINIC_BOOK
 
 
 def _is_confirm(purpose: CallPurpose) -> bool:
-    return purpose is CallPurpose.INTERPRETER_CONFIRM
+    """Any BINDING confirm -- family or freelance -- as opposed to the
+    earlier, non-binding availability asks."""
+    return purpose in (CallPurpose.INTERPRETER_CONFIRM, CallPurpose.FAMILY_CONFIRM)
 
 
 def _phones_called() -> list[str]:
@@ -165,11 +185,15 @@ def clinic(
     notes: str = "",
     blocked_reason: str | None = None,
     cancels: bool = True,
+    offers_alternate: "tuple[str, str] | None" = None,
 ) -> ClinicCandidate:
     """Registers this clinic's scripted responses and returns the candidate
     object, so scenarios can assert on what the search wrote back into it.
     `blocked_reason` makes the BOOKING call refuse (booked False); `cancels`
-    says whether a later CANCEL call succeeds."""
+    says whether a later CANCEL call succeeds. `offers_alternate=(date, time)`
+    scripts a misbehaving booking call that reports booked=True for a
+    DIFFERENT date/time than whatever was actually asked for -- a real,
+    confirmed bug (see scenario_clinic_alternate_date_rejected)."""
 
     def resolver(task, phone_, purpose):
         CALLS.append((phone_, task, purpose))
@@ -180,6 +204,13 @@ def clinic(
                 return _ok({
                     "booked": False, "blocked_reason": blocked_reason,
                     "requirements": list(requirements),
+                })
+            if offers_alternate:
+                alt_date, alt_time = offers_alternate
+                return _ok({
+                    "booked": True, "confirmed_by": "Dana",
+                    "confirmed_date": alt_date, "confirmed_time": alt_time,
+                    "booking_reference": booking_reference,
                 })
             return _ok({
                 "booked": True, "confirmed_by": "Dana",
@@ -206,10 +237,23 @@ def clinic(
     )
 
 
-def family(name: str, relation: str, phone: str, *, covers: tuple = (), answers: bool = True) -> dict:
+def family(
+    name: str, relation: str, phone: str, *,
+    covers: tuple = (), answers: bool = True, confirms: bool = True,
+) -> dict:
+    """`confirms` scripts the answer to the LATER binding confirm call (after
+    booking), separately from `covers`/`answers`, which scripts the earlier
+    availability call -- a member can say yes to availability and still
+    decline the binding confirm, or never be asked availability at all and
+    still be reached directly for a confirm (the fallback path)."""
+
     def resolver(task, phone_, purpose):
         CALLS.append((phone_, task, purpose))
-        return _ok({"coverable_slots": list(covers)}) if answers else _no_answer()
+        if not answers:
+            return _no_answer()
+        if purpose is CallPurpose.FAMILY_CONFIRM:
+            return _ok({"confirmed": confirms})
+        return _ok({"coverable_slots": list(covers)})
 
     register_mock(phone, resolver)
     return {"name": name, "relation": relation, "phone_number": phone}
@@ -347,6 +391,19 @@ def scenario_clinic_search() -> None:
         "BUG: a clinic-search or interpreter call leaked the patient's name -- "
         "only the booking call and the family call use it."
     )
+    assert all(USER_PHONE not in t for t in interpreter_tasks), (
+        "BUG: the non-binding availability call gave out the patient's phone number"
+    )
+    assert interpreter_tasks and all("D (match, nearer)" in t for t in interpreter_tasks), (
+        "the availability ask must say which clinic the job is at, so an "
+        "interpreter can judge travel before quoting a rate"
+    )
+    confirm_task = next(t for _, t, p in CALLS if p is CallPurpose.INTERPRETER_CONFIRM)
+    for expected in ("Dana Reyes", USER_PHONE, "D (match, nearer)"):
+        assert expected in confirm_task, (
+            f"the binding confirm call -- made only to whoever is actually "
+            f"hired -- must give {expected!r}"
+        )
     assert all(
         "SSH-4471902" not in t and "1991-04-12" not in t for t in clinic_search_tasks
     ), "BUG: a clinic-search call gave out the policy number or date of birth"
@@ -483,12 +540,15 @@ def scenario_family_locks_in() -> None:
     """
     Family is a definite, ordered, call-only list checked AFTER the clinic
     match. The first member doesn't answer; the second can cover a matched
-    slot and is locked in, and nobody further is called. The secured family
-    member is then TEXTED the confirmation, alongside the user.
+    slot and is locked in, and nobody further is called during the search.
+    Once the clinic is booked, that same member gets a binding confirm call
+    (Step 5) before anyone is texted -- their earlier "yes" was to a slot that
+    wasn't booked yet.
 
     Freelance candidates ARE passed but deliberately left unmocked -- if
-    family were skipped or its answer discarded, the run would try to call
-    them and raise KeyError loudly instead of quietly succeeding another way.
+    family were skipped, or its confirm skipped or declined, the run would
+    try to call them and raise KeyError loudly instead of quietly succeeding
+    another way.
     """
     _reset()
     thu, mon = _date(3), _date(7)
@@ -522,13 +582,125 @@ def scenario_family_locks_in() -> None:
     )
     booked_task = next(t for _, t, p in CALLS if _is_booking(p))
     assert f"Book the {mon} 15:00 appointment" in booked_task
+    confirm_calls = [(phone, purpose) for phone, _, purpose in CALLS if purpose is CallPurpose.FAMILY_CONFIRM]
+    assert confirm_calls == [(sister["phone_number"], CallPurpose.FAMILY_CONFIRM)], (
+        f"BUG: expected exactly one family confirm call, to Maya -- got {confirm_calls}"
+    )
+    book_idx = next(i for i, (_, _, p) in enumerate(CALLS) if _is_booking(p))
+    confirm_idx = next(i for i, (_, _, p) in enumerate(CALLS) if p is CallPurpose.FAMILY_CONFIRM)
+    assert book_idx < confirm_idx, (
+        "the clinic must be booked BEFORE the family member is asked to commit"
+    )
     texts = [e for e in result.evidence if "Confirmation text" in e]
     assert len(texts) == 2 and any("Maya Reyes" in t for t in texts), (
         f"The secured family member is texted the outcome too, got {texts}"
     )
     print("\nOK: family called one at a time in list order after the clinic "
-          "match, stopped at the first yes, no freelance call placed, and the "
-          "secured family member was texted.")
+          "match, stopped at the first yes, confirmed for real after booking, "
+          "no freelance call placed, and the secured family member was texted.")
+
+
+def scenario_family_confirm_fallback() -> None:
+    """
+    The binding family confirm (Step 5) can fail, and three things can happen
+    next, each its own phase below:
+
+      A. The locked-in member declines; the next member on the list, never
+         asked during the search, is reached directly and confirms. Source
+         stays "family".
+      B. Every family member declines; a freelance search for this one
+         already-booked slot finds someone who confirms. Source flips to
+         "freelance" -- exactly the tier that would have run if no family
+         member had matched in the first place.
+      C. Nobody -- family or freelance -- confirms, so the clinic booking is
+         cancelled.
+    """
+    _reset()
+    thu = _date(3)
+
+    # --- A: locked-in member declines, backup (never called) confirms ------
+    matched = clinic("Clinic", "+17025551061", 1.0, slots=((thu, "14:00"),),
+                     booking_reference="CLINIC-FAMFALLBACK-A")
+    primary = family("Primary", "sister", "+17025552061",
+                     covers=(f"{thu} 14:00",), confirms=False)
+    backup = family("Backup", "cousin", "+17025552062", confirms=True)
+    never = freelancer("Freelancer", "+17025553061", covers=(f"{thu} 14:00",),
+                       rate=50.0, register=False)
+
+    result = run_interpreter_mesh(
+        load_user_input(_input_json(family_members=[primary, backup])),
+        clinics=[matched], candidates=[never],
+    )
+    print("\n--- RESULT (A) ---")
+    print(result)
+
+    assert result.interpreter_source == "family"
+    assert result.interpreter["name"] == "Backup"
+    confirm_order = [phone for phone, _, p in CALLS if p is CallPurpose.FAMILY_CONFIRM]
+    assert confirm_order == [primary["phone_number"], backup["phone_number"]], (
+        f"BUG: expected the primary confirm to be tried before the backup, got {confirm_order}"
+    )
+    assert never.phone not in _phones_called(), (
+        "BUG: freelance was called even though a family fallback confirmed"
+    )
+    texts = [e for e in result.evidence if "Confirmation text" in e]
+    assert any("Backup" in t for t in texts), f"the member who actually confirmed is texted, got {texts}"
+
+    # --- B: every family member declines, freelance covers the exact slot --
+    _reset()
+    matched_b = clinic("Clinic B", "+17025551071", 1.0, slots=((thu, "14:00"),),
+                       booking_reference="CLINIC-FAMFALLBACK-B")
+    primary_b = family("Primary B", "sister", "+17025552071",
+                       covers=(f"{thu} 14:00",), confirms=False)
+    kim = freelancer("J. Kim", "+17025553071", covers=(f"{thu} 14:00",), rate=95.0)
+
+    result_b = run_interpreter_mesh(
+        load_user_input(_input_json(family_members=[primary_b])),
+        clinics=[matched_b], candidates=[kim],
+    )
+    print("\n--- RESULT (B) ---")
+    print(result_b)
+
+    assert result_b.interpreter_source == "freelance", (
+        "BUG: source must flip to freelance once every family member declines"
+    )
+    assert result_b.interpreter["name"] == "J. Kim"
+    assert result_b.family_tier_result == "locked_in", (
+        "family_tier_result describes the SEARCH tier's outcome, not who "
+        "ultimately confirmed -- it must not be rewritten by the fallback"
+    )
+    assert sum(1 for _, _, p in CALLS if p is CallPurpose.CLINIC_BOOK) == 1, (
+        "the clinic must still be booked only once, not re-booked for the fallback"
+    )
+
+    # --- C: nobody confirms, the booking is cancelled -----------------------
+    _reset()
+    undoable = clinic("Clinic C", "+17025551081", 1.0, slots=((thu, "14:00"),),
+                      booking_reference="CLINIC-FAMFALLBACK-C")
+    primary_c = family("Primary C", "sister", "+17025552081",
+                       covers=(f"{thu} 14:00",), confirms=False)
+    declines = freelancer("Declines", "+17025553081", covers=(f"{thu} 14:00",),
+                          rate=80.0, confirms=False)
+    try:
+        run_interpreter_mesh(
+            load_user_input(_input_json(family_members=[primary_c])),
+            clinics=[undoable], candidates=[declines],
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        print(f"\n--- RAISED (expected, C) ---\n{message}")
+    else:
+        raise AssertionError("BUG: nobody confirmed, yet the run succeeded")
+
+    assert "family member and freelance interpreter" in message
+    assert "was cancelled" in message
+    assert [p for _, _, p in CALLS][-1] is CallPurpose.CLINIC_CANCEL, (
+        "the booking must be undone last"
+    )
+
+    print("\nOK: a declined family confirm fell back to the next family "
+          "member, then to freelance for the exact booked slot, and to "
+          "cancellation when nobody confirmed at all.")
 
 
 def scenario_clinic_search_exhausted() -> None:
@@ -628,40 +800,144 @@ def scenario_requirements() -> None:
           "own reason.")
 
 
-def scenario_freelance_parallel() -> None:
-    """A batch of three freelancers is called at the same time, not one after
-    another. Each availability call waits at a barrier that only opens once all
-    three are in flight, so a sequential search would leave the barrier
-    waiting and fail here.
+def scenario_clinic_alternate_date_rejected() -> None:
+    """Regression test for a real, confirmed bug: the user approved
+    2026-09-30, the clinic offered 2026-10-01 instead, and the calling agent
+    accepted it and reported booked=True. Nothing checked WHICH date was
+    actually confirmed, so the run went on to tell the interpreter and the
+    user about 2026-09-30 -- a date that was never actually booked.
 
-    The cheapest is last in the batch and the rates are out of order, so the
-    ranking can't be an accident of which call happened to finish first."""
+    A booking call that reports a different confirmed_date/confirmed_time
+    than what was asked for must be treated exactly like a refusal: the run
+    ends there, and nothing after book_slot() -- no interpreter confirm, no
+    confirmation texts -- may ever run."""
+    _reset()
+    approved = _date(3)       # what the user actually approved -- 14:00 overlaps
+                              # the default input's free window on this day
+    offered = _date(4)        # what the clinic offers instead, mid-booking-call
+    switcheroo = clinic("FYZICAL Therapy", "+17025551091", 1.0,
+                        slots=((approved, "14:00"),),
+                        offers_alternate=(offered, "14:00"))
+    kim = freelancer("J. Kim", "+17025553091", covers=(f"{approved} 14:00",), rate=95.0)
+
+    try:
+        run_interpreter_mesh(
+            load_user_input(_input_json()), clinics=[switcheroo], candidates=[kim]
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        print(f"\n--- RAISED (expected) ---\n{message}")
+    else:
+        raise AssertionError(
+            "BUG: the clinic booked a different date than the user approved, "
+            "and the run treated it as a success"
+        )
+
+    assert "REJECTED" in message
+    assert approved in message and offered in message, (
+        f"the user must be told BOTH the date they approved and the date the "
+        f"clinic actually booked, got: {message}"
+    )
+    assert not any(_is_confirm(p) for _, _, p in CALLS), (
+        "BUG: an interpreter was confirmed for a date that was never actually booked"
+    )
+    assert not any(p is CallPurpose.CLINIC_CANCEL for _, _, p in CALLS), (
+        "nothing needs cancelling on OUR side -- book_slot() never returned success"
+    )
+    assert len(PROPOSALS) == 1, "the user was asked once, over the ORIGINAL approved slot"
+    print("\nOK: a clinic that booked a different date than the one approved "
+          "was rejected outright -- the run ended there, and no interpreter "
+          "was ever asked to confirm a date that was never actually booked.")
+
+
+def scenario_freelance_parallel() -> None:
+    """Proves the PARALLEL dispatch mode still works, even though
+    PARALLEL_BATCH_CALLS defaults to OFF today -- a shared/free CALL-E line
+    only places one call at a time on the account's behalf, so dialling a
+    batch at once gains nothing until a dedicated number is bought. This
+    scenario temporarily forces it on to prove the capability is there for
+    when that happens, without changing the production default. The batch
+    SIZE (2) is unaffected either way -- see interpreter_matching's module
+    docstring for why size and dispatch are two different knobs.
+
+    Each availability call waits at a barrier that only opens once both are
+    in flight, so a sequential dispatch would leave the barrier waiting and
+    fail here. The cheapest is last in the batch and the rates are out of
+    order, so the ranking can't be an accident of which call happened to
+    finish first."""
+    _reset()
+    real_parallel = _force_parallel_batch(True)
+    try:
+        thu = _date(3)
+        barrier = threading.Barrier(2, timeout=5)
+        a = freelancer("A", "+17025553051", covers=(f"{thu} 14:00",), rate=120.0, wait_for=barrier)
+        b = freelancer("B", "+17025553052", covers=(f"{thu} 14:00",), rate=80.0, wait_for=barrier)
+        next_batch = freelancer("C", "+17025553053", covers=(f"{thu} 14:00",), rate=10.0,
+                                register=False)
+        matched = clinic("Clinic", "+17025551051", 1.0, slots=((thu, "14:00"),),
+                         booking_reference="CLINIC-PAR")
+
+        result = run_interpreter_mesh(
+            load_user_input(_input_json()), clinics=[matched], candidates=[a, b, next_batch]
+        )
+        print("\n--- RESULT ---")
+        print(result)
+
+        assert not barrier.broken, "both calls never overlapped"
+        assert result.interpreter["name"] == "B", "cheapest of the batch wins, whatever finished first"
+        assert PROPOSALS[0].interpreter["name"] == "B"
+        assert [alt["name"] for alt in PROPOSALS[0].alternates] == ["A"], (
+            "fallbacks are ordered cheapest-first regardless of arrival order"
+        )
+        assert next_batch.phone not in _phones_called(), "a match in the first batch ends the search"
+    finally:
+        _restore_parallel_batch(real_parallel)
+    print("\nOK: with parallel dispatch forced on for this test, both "
+          "freelancers were in flight at once, the cheapest won regardless "
+          "of arrival order, and no second batch was called. (Production "
+          "default stays sequential -- see SIGNCALL_FREELANCE_PARALLEL_BATCH.)")
+
+
+def scenario_sequential_batch_calls_both() -> None:
+    """Regression test for the exact misunderstanding this design almost
+    shipped with: sequential dispatch must still call EVERY member of the
+    batch and still pick the cheapest of them -- it must NOT stop as soon as
+    the first one says yes. Both freelancers here are available; the one
+    dialled FIRST is the pricier one, so if the search stopped at the first
+    yes (wrong), the pricier one would win. Cheapest-wins here proves the
+    second one was actually called and compared, not skipped."""
+    assert not interpreter_matching.PARALLEL_BATCH_CALLS, (
+        "this scenario asserts call ORDER, which only means something under "
+        "sequential dispatch -- it isn't meaningful (or reliable) in parallel mode"
+    )
     _reset()
     thu = _date(3)
-    barrier = threading.Barrier(3, timeout=5)
-    a = freelancer("A", "+17025553051", covers=(f"{thu} 14:00",), rate=120.0, wait_for=barrier)
-    b = freelancer("B", "+17025553052", covers=(f"{thu} 14:00",), rate=100.0, wait_for=barrier)
-    c = freelancer("C", "+17025553053", covers=(f"{thu} 14:00",), rate=80.0, wait_for=barrier)
-    next_batch = freelancer("D", "+17025553054", covers=(f"{thu} 14:00",), rate=10.0,
-                            register=False)
-    matched = clinic("Clinic", "+17025551051", 1.0, slots=((thu, "14:00"),),
-                     booking_reference="CLINIC-PAR")
+    pricier_first = freelancer("A (pricier, dialled first)", "+17025553061",
+                               covers=(f"{thu} 14:00",), rate=130.0)
+    cheaper_second = freelancer("B (cheaper, dialled second)", "+17025553062",
+                                covers=(f"{thu} 14:00",), rate=80.0)
+    matched = clinic("Clinic", "+17025551061", 1.0, slots=((thu, "14:00"),),
+                     booking_reference="CLINIC-SEQ")
 
     result = run_interpreter_mesh(
-        load_user_input(_input_json()), clinics=[matched], candidates=[a, b, c, next_batch]
+        load_user_input(_input_json()), clinics=[matched],
+        candidates=[pricier_first, cheaper_second],
     )
     print("\n--- RESULT ---")
     print(result)
 
-    assert not barrier.broken, "the three calls never overlapped"
-    assert result.interpreter["name"] == "C", "cheapest of the batch wins, whatever finished first"
-    assert PROPOSALS[0].interpreter["name"] == "C"
-    assert [alt["name"] for alt in PROPOSALS[0].alternates] == ["B", "A"], (
-        "fallbacks are ordered cheapest-first regardless of arrival order"
+    availability_calls = [phone for phone, _, p in CALLS if p is CallPurpose.INTERPRETER_AVAILABILITY]
+    assert availability_calls == [pricier_first.phone, cheaper_second.phone], (
+        f"BUG: expected both freelancers dialled in order, got {availability_calls}"
     )
-    assert next_batch.phone not in _phones_called(), "a match in the first batch ends the search"
-    print("\nOK: all three freelancers were in flight at once, the cheapest won "
-          "regardless of arrival order, and no second batch was called.")
+    assert result.interpreter["name"] == "B (cheaper, dialled second)", (
+        "BUG: the search stopped at the first available freelancer instead "
+        "of calling the whole batch and picking the cheapest -- this is "
+        "exactly the regression this scenario exists to catch"
+    )
+    print("\nOK: sequential dispatch still called BOTH batch members -- the "
+          "first one saying yes did not skip the second -- and the cheaper "
+          "one, called second, still won.")
 
 
 def scenario_declined() -> None:
@@ -1007,9 +1283,13 @@ def scenario_call_routing() -> None:
         "BUG: assignments survived a reset and would leak between runs"
     )
     # A family call dials the family member's own number, exactly as entered
-    # in the profile. Clinics and interpreters never dial directly.
+    # in the profile -- both the availability ask and the later binding
+    # confirm. Clinics and interpreters never dial directly.
     sister = "+17025550123"
-    assert calle_run.resolve_call_target(sister, CallPurpose.FAMILY_AVAILABILITY, 0) == sister
+    for purpose in (CallPurpose.FAMILY_AVAILABILITY, CallPurpose.FAMILY_CONFIRM):
+        assert calle_run.resolve_call_target(sister, purpose, 0) == sister, (
+            f"BUG: a {purpose.value} call did not dial the family member directly"
+        )
     for purpose in (CallPurpose.CLINIC_SEARCH, CallPurpose.CLINIC_BOOK,
                     CallPurpose.INTERPRETER_AVAILABILITY, CallPurpose.INTERPRETER_CONFIRM):
         assert calle_run.resolve_call_target(sister, purpose, 0) in lines, (
@@ -1064,20 +1344,26 @@ def scenario_api_endpoint() -> None:
         from ..api import demo_mocks, notify  # noqa: PLC0415
 
         events: list[dict] = []
-        real_send, real_build = notify.send_event, demo_mocks.build_resolver
+        real_send = notify.send_event
+        real_build, real_cancel_build = demo_mocks.build_resolver, demo_mocks.build_cancel_resolver
         real_timeout = server.CONFIRM_TIMEOUT_SECONDS
 
-        def spying_build(user, gate=None):
-            base = real_build(user, gate)
-
+        def _spying(base_resolver):
             def resolver(task, phone, purpose):
                 CALLS.append((phone, task, purpose))
-                return base(task, phone, purpose)
+                return base_resolver(task, phone, purpose)
 
             return resolver
 
+        def spying_build(user, gate=None):
+            return _spying(real_build(user, gate))
+
+        def spying_cancel_build():
+            return _spying(real_cancel_build())
+
         notify.send_event = lambda event: events.append(event) or True
         demo_mocks.build_resolver = spying_build
+        demo_mocks.build_cancel_resolver = spying_cancel_build
 
         def start_run() -> dict:
             response = client.post("/runs", json=_input_json())
@@ -1150,6 +1436,36 @@ def scenario_api_endpoint() -> None:
         assert order.index(CallPurpose.CLINIC_BOOK) < order.index(CallPurpose.INTERPRETER_CONFIRM)
         assert events[-1]["event"] == "run_finished" and events[-1]["status"] == "succeeded"
         assert events[-1]["result"]["appointment"]["booked"] is True
+        assert "_patient_name" not in status, (
+            "BUG: get_run() leaked an internal (leading-underscore) field"
+        )
+
+        # 4b. The user cancels the succeeded booking: the clinic is called to
+        #     cancel, then the confirmed interpreter is released. Only valid
+        #     once, and only from succeeded.
+        assert status["result"]["clinic_contact"]["phone"], (
+            "a succeeded result must carry enough contact info to cancel it later"
+        )
+        calls_before_cancel = len(CALLS)
+        cancel_resp = client.post(f"/runs/{run_id}/cancel")
+        assert cancel_resp.status_code == 202, cancel_resp.text
+        assert cancel_resp.json()["status"] == "cancelling"
+        assert client.post(f"/runs/{run_id}/cancel").status_code == 409, (
+            "cancelling while already cancelling must be refused, same as a second confirm answer"
+        )
+        cancelled = wait_for(run_id, "cancelled", "cancel_failed")
+        assert cancelled["status"] == "cancelled", (
+            f"cancellation did not succeed: {cancelled}"
+        )
+        assert cancelled["cancellation"]["clinic_cancelled"] is True
+        assert cancelled["cancellation"]["interpreter_released"] is True
+        cancel_purposes = [p for _, _, p in CALLS[calls_before_cancel:]]
+        assert CallPurpose.CLINIC_CANCEL in cancel_purposes
+        assert CallPurpose.INTERPRETER_RELEASE in cancel_purposes
+        assert events[-1]["event"] == "run_cancelled" and events[-1]["status"] == "cancelled"
+        assert client.post(f"/runs/{run_id}/cancel").status_code == 409, (
+            "cancelling an already-cancelled run must be refused too"
+        )
 
         # 5. Saying no ends the run with nothing booked, and frees the lock.
         _reset()
@@ -1176,7 +1492,8 @@ def scenario_api_endpoint() -> None:
         assert client.get("/runs/not-a-real-id").status_code == 404
         assert confirm("not-a-real-id", True).status_code == 404
     finally:
-        notify.send_event, demo_mocks.build_resolver = real_send, real_build
+        notify.send_event = real_send
+        demo_mocks.build_resolver, demo_mocks.build_cancel_resolver = real_build, real_cancel_build
         server.CONFIRM_TIMEOUT_SECONDS = real_timeout
         if saved_token is not None:
             os.environ["APIFY_API_TOKEN"] = saved_token
@@ -1186,8 +1503,10 @@ def scenario_api_endpoint() -> None:
           "accepted 202, paused at awaiting_confirmation with a proposal and "
           "only non-binding calls placed, and told the user; approving booked "
           "the clinic then confirmed the interpreter; a second answer was "
-          "refused 409; saying no ended it as declined with nothing booked; "
-          "no answer timed out to declined; the lock was released each time.")
+          "refused 409; cancelling the succeeded booking cancelled the clinic "
+          "and released the interpreter, refused a second cancel, and leaked "
+          "no internal fields; saying no ended it as declined with nothing "
+          "booked; no answer timed out to declined; the lock was released each time.")
 
 
 SCENARIOS = {
@@ -1196,9 +1515,12 @@ SCENARIOS = {
     "decline_then_retry": scenario_decline_then_retry,
     "cheapest_wrong_day": scenario_cheapest_wrong_day,
     "family_locks_in": scenario_family_locks_in,
+    "family_confirm_fallback": scenario_family_confirm_fallback,
     "clinic_search_exhausted": scenario_clinic_search_exhausted,
     "requirements": scenario_requirements,
+    "clinic_alternate_date_rejected": scenario_clinic_alternate_date_rejected,
     "freelance_parallel": scenario_freelance_parallel,
+    "sequential_batch_calls_both": scenario_sequential_batch_calls_both,
     "declined": scenario_declined,
     "interpreters_all_decline": scenario_interpreters_all_decline,
     "input_validation": scenario_input_validation,

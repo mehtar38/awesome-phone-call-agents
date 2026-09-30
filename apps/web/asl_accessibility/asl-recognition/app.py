@@ -399,7 +399,7 @@ def _sync_from_workflow(booking: dict) -> dict:
     this server was down when one was sent. While a run is unfinished, ask the
     workflow directly, so a lost notification can't leave the page waiting
     forever. Best effort -- any failure just leaves the stored state as it is."""
-    if booking["status"] not in ("running", "awaiting_confirmation") or not BOOKING_WORKFLOW_URL:
+    if booking["status"] not in ("running", "awaiting_confirmation", "cancelling") or not BOOKING_WORKFLOW_URL:
         return booking
     try:
         with urllib.request.urlopen(_workflow_url(booking["run_id"]), timeout=5) as resp:
@@ -414,6 +414,11 @@ def _sync_from_workflow(booking: dict) -> dict:
         db.record_outcome(
             booking["run_id"], status,
             result=run.get("result"), error=run.get("error"), reason=run.get("reason"),
+        )
+    elif status in ("cancelled", "cancel_failed"):
+        db.record_cancellation(
+            booking["run_id"], status,
+            cancellation=run.get("cancellation"), error=run.get("error"),
         )
     else:
         return booking
@@ -430,7 +435,8 @@ def receive_notification_endpoint(payload: dict = Body(...)):
 
     Events, from the workflow's api/notify.py:
       confirmation_requested  {run_id, proposal}
-      run_finished            {run_id, status, result, error, reason}"""
+      run_finished            {run_id, status, result, error, reason}
+      run_cancelled           {run_id, status, cancellation, error}"""
     run_id = payload.get("run_id")
     if not isinstance(run_id, str) or not run_id:
         raise HTTPException(400, "run_id is required")
@@ -449,6 +455,11 @@ def receive_notification_endpoint(payload: dict = Body(...)):
             run_id, status,
             result=payload.get("result"), error=payload.get("error"), reason=payload.get("reason"),
         )
+    elif event == "run_cancelled":
+        status = payload.get("status")
+        if status not in ("cancelled", "cancel_failed"):
+            raise HTTPException(400, f"unknown cancellation status {status!r}")
+        db.record_cancellation(run_id, status, cancellation=payload.get("cancellation"), error=payload.get("error"))
     else:
         raise HTTPException(400, f"unknown event {event!r}")
     return {"status": "received"}
@@ -457,9 +468,14 @@ def receive_notification_endpoint(payload: dict = Body(...)):
 @app.get("/bookings/{run_id}")
 def get_booking_endpoint(run_id: str, user_id: str = Query(...)):
     """What the progress / confirm / outcome screens poll. `status` is one of
-    running, awaiting_confirmation, succeeded, declined, failed."""
+    running, awaiting_confirmation, succeeded, declined, failed, and -- once a
+    succeeded booking's own cancel button has been used -- cancelling,
+    cancelled, cancel_failed."""
     booking = _sync_from_workflow(_booking_for(run_id, user_id))
-    return {key: booking[key] for key in ("run_id", "status", "proposal", "result", "error", "reason")}
+    return {
+        key: booking[key]
+        for key in ("run_id", "status", "proposal", "result", "error", "reason", "cancellation")
+    }
 
 
 @app.post("/bookings/{run_id}/confirm")
@@ -492,6 +508,36 @@ def confirm_booking_endpoint(run_id: str, payload: dict = Body(...)):
 
     db.resolve_confirmation(run_id, approved)
     return {"status": "running" if approved else "declined"}
+
+
+@app.post("/bookings/{run_id}/cancel")
+def cancel_booking_endpoint(run_id: str, payload: dict = Body(...)):
+    """The user cancelling an already-booked appointment from the outcome
+    screen. Forwarded to the workflow, which places the real cancel/release
+    calls; the frontend then polls the same GET /bookings/{run_id} it already
+    uses, watching for status to move on from 'cancelling'."""
+    booking = _booking_for(run_id, payload.get("user_id"))
+    if booking["status"] not in ("succeeded", "cancel_failed"):
+        raise HTTPException(409, "This booking has nothing to cancel right now.")
+    if not BOOKING_WORKFLOW_URL:
+        raise HTTPException(500, "BOOKING_WORKFLOW_URL is not set on the server")
+
+    req = urllib.request.Request(
+        _workflow_url(run_id, "cancel"), data=b"", method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15):
+            pass
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            raise HTTPException(409, "This booking is already being cancelled, or was already cancelled.")
+        raise HTTPException(502, f"booking workflow rejected the cancellation ({e.code})")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"could not reach the booking workflow at {BOOKING_WORKFLOW_URL}: {e.reason}")
+
+    db.record_cancelling(run_id)
+    return {"status": "cancelling"}
 
 
 # Serves static/index.html at GET / (and any other file under static/).

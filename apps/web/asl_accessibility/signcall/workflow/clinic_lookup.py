@@ -2,10 +2,11 @@
 Finding clinics to call. No CALL-E dependency -- this is pure lookup.
 
 The user gives a ZIP and an appointment type; this module turns that into up
-to 10 nearby clinics, nearest first, for clinic_call.search_clinics() to work
-through in batches of 3. Each clinic is exactly four fields -- name, type,
-phone, zipcode -- defined by schemas/clinic_record.schema.json and validated
-against it before anything downstream sees it.
+to 10 nearby clinics, nearest first, for clinic_call.search_clinics() to call
+one at a time. Each clinic is four required fields -- name, type, phone,
+zipcode -- plus an optional street address when the source actually has one,
+all defined by schemas/clinic_record.schema.json and validated against it
+before anything downstream sees it.
 
 Mechanism: Apify's Google Maps Scraper (actor compass/crawler-google-places).
 It returns the Maps listing itself, so name, category, phone and postal code
@@ -135,16 +136,20 @@ def record_to_candidate(record: dict, source: str) -> ClinicCandidate:
         zipcode=record["zipcode"],
         clinic_type=record["type"],
         source=source,
+        address=record.get("address"),
     )
 
 
 def candidate_to_record(clinic: ClinicCandidate) -> dict:
-    return {
+    record = {
         "name": clinic.name,
         "type": clinic.clinic_type,
         "phone": clinic.phone,
         "zipcode": clinic.zipcode,
     }
+    if clinic.address:
+        record["address"] = clinic.address
+    return record
 
 
 # --- extraction ----------------------------------------------------------
@@ -212,7 +217,14 @@ def place_to_record(place: dict, appointment_type: AppointmentType) -> dict | No
     if not name:
         return None
 
-    return {"name": name, "type": clinic_type, "phone": phone, "zipcode": zipcode}
+    record = {"name": name, "type": clinic_type, "phone": phone, "zipcode": zipcode}
+    # Optional: the listing's own street address, when Maps returned one --
+    # unlike the four fields above, nothing downstream depends on this being
+    # present, so a missing or blank value is left out rather than guessed at.
+    address = (place.get("address") or "").strip()
+    if address:
+        record["address"] = address
+    return record
 
 
 def places_to_records(places: list, appointment_type: AppointmentType) -> list[dict]:
@@ -310,15 +322,20 @@ def _fallback_records(appointment_type: AppointmentType) -> list[dict]:
     global _fallback_cache
     if _fallback_cache is None:
         _fallback_cache = json.loads(FALLBACK_PATH.read_text(encoding="utf-8"))
-    return [
-        {
+    records = []
+    for entry in _fallback_cache["clinics"].get(appointment_type.value, []):
+        record = {
             "name": entry["name"],
             "type": entry["type"],
             "phone": entry["phone_number"],
             "zipcode": entry["zipcode"],
         }
-        for entry in _fallback_cache["clinics"].get(appointment_type.value, [])
-    ]
+        # No invented street exists for a synthetic clinic -- city + ZIP is
+        # the honest ceiling of what this data can say about where it is.
+        if entry.get("city"):
+            record["address"] = f"{entry['city']}, NV {entry['zipcode']}"
+        records.append(record)
+    return records
 
 
 def _dump(path, zipcode: str, appointment_type: AppointmentType, source: str, records: list[dict]) -> None:

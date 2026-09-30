@@ -48,9 +48,17 @@ class CallPurpose(str, Enum):
     CLINIC_BOOK = "clinic_book"
     CLINIC_CANCEL = "clinic_cancel"
     FAMILY_AVAILABILITY = "family_availability"
+    FAMILY_CONFIRM = "family_confirm"
+    FAMILY_RELEASE = "family_release"
     INTERPRETER_AVAILABILITY = "interpreter_availability"
     INTERPRETER_CONFIRM = "interpreter_confirm"
     INTERPRETER_RELEASE = "interpreter_release"
+
+# Every purpose that reaches a family member. All three ring the number as
+# entered in the user's profile -- see resolve_call_target.
+_FAMILY_PURPOSES = frozenset({
+    CallPurpose.FAMILY_AVAILABILITY, CallPurpose.FAMILY_CONFIRM, CallPurpose.FAMILY_RELEASE,
+})
 
 # Sourced from CALL-E's CLI documentation (references/commands.md, in the
 # `calle` skill) as of 2026-09-12, normalized to uppercase since the
@@ -173,6 +181,45 @@ def _poll_until_terminal(client, call_id: str, timeout_seconds: float = 600.0) -
         time.sleep(2.0)
 
 
+# A shared/free CALL-E line runs only ONE call at a time on the account's
+# behalf -- this app's own batch code fires several "at once" on purpose (see
+# interpreter_matching.py), so everyone past the first hits this cap instead
+# of a queued call. It is an account-level limit, not a bug: a dedicated
+# number raises it to 10 concurrent, but nothing here requires buying one --
+# waiting for the line to free up (a call typically runs under two minutes)
+# and trying again gets the same batch through, just staggered instead of
+# simultaneous.
+CONCURRENCY_RETRY_INTERVAL_SECONDS = 10.0
+CONCURRENCY_RETRY_DEADLINE_SECONDS = float(
+    os.environ.get("CALLE_CONCURRENCY_RETRY_DEADLINE_SECONDS", "300")
+)
+
+
+def _is_concurrency_limit_error(exc: Exception) -> bool:
+    """CALL-E's own wording for this ("...is at its account concurrency "
+    limit of N...") is matched on substring rather than a status code or
+    error `code` field, since neither was confirmed against a live response
+    -- see the module docstring's policy on unverified assumptions."""
+    message = getattr(exc, "message", None)
+    return isinstance(message, str) and "concurrency limit" in message.lower()
+
+
+def _create_call_with_concurrency_retry(client, **kwargs) -> dict:
+    """client.calls.create(), but a concurrency-limit error waits and tries
+    again instead of failing the whole batch outright. Every other error
+    (auth, a malformed request, a real outage) still raises immediately."""
+    import calle as calle_sdk  # see _get_client() for why this is deferred
+
+    deadline = time.monotonic() + CONCURRENCY_RETRY_DEADLINE_SECONDS
+    while True:
+        try:
+            return client.calls.create(**kwargs)
+        except calle_sdk.CalleAPIError as exc:
+            if not _is_concurrency_limit_error(exc) or time.monotonic() >= deadline:
+                raise
+            time.sleep(CONCURRENCY_RETRY_INTERVAL_SECONDS)
+
+
 # --- Demo call routing (REAL mode only) ---------------------------------
 #
 # Clinics and freelance interpreters are only ever rung on one of the three
@@ -190,7 +237,7 @@ def _poll_until_terminal(client, call_id: str, timeout_seconds: float = 600.0) -
 # assignment is STICKY: the clinic searched on line 2 is booked on line 2, and
 # an interpreter confirmed on line 3 was asked on line 3.
 
-DEMO_TEST_LINES = ("+18722794605", "+17168683628", "+19496780146")
+DEMO_TEST_LINES = ("+18722794605", "+19496780146", "+19496780146")
 
 _line_assignments: dict[str, str] = {}
 _routing_lock = threading.Lock()
@@ -247,10 +294,11 @@ def resolve_dial_target(logical_phone: str, batch_position: int | None = None) -
 def resolve_call_target(
     logical_phone: str, purpose: CallPurpose, batch_position: int | None = None
 ) -> str:
-    """The number a real-mode call actually dials. A family call rings the
+    """The number a real-mode call actually dials. A family call -- whether
+    it's the availability ask or the later binding confirm -- rings the
     family member's own number, exactly as the user entered it in their
     profile. Every other call goes to a test line (see resolve_dial_target)."""
-    if purpose is CallPurpose.FAMILY_AVAILABILITY:
+    if purpose in _FAMILY_PURPOSES:
         return logical_phone
     return resolve_dial_target(logical_phone, batch_position)
 
@@ -320,7 +368,11 @@ def call_and_wait(
 
     Real mode places an actual phone call and blocks until it reaches a
     terminal status. Safe to call from several threads at once: calls to
-    different numbers run in parallel, calls to the same number queue.
+    different numbers run in parallel, calls to the same number queue --
+    though a shared/free CALL-E line only actually places ONE call at a time
+    regardless (see _create_call_with_concurrency_retry above), so several
+    threads calling different numbers may still be staggered by the
+    account's own concurrency cap rather than truly simultaneous.
     """
     if MOCK_MODE:
         resolver = _mock_resolvers.get(phone) or _default_mock
@@ -335,10 +387,8 @@ def call_and_wait(
     client = _get_client()
     dial_target = resolve_call_target(phone, purpose, batch_position)
     with _dial_lock(dial_target):
-        created = client.calls.create(
-            task=task,
-            recipient={"phone": dial_target},
-            result_schema=result_schema,
+        created = _create_call_with_concurrency_retry(
+            client, task=task, recipient={"phone": dial_target}, result_schema=result_schema,
         )
         call_id = str(created["id"])
         final = _poll_until_terminal(client, call_id)

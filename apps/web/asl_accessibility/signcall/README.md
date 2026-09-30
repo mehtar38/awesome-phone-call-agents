@@ -238,11 +238,12 @@ Things to know before pointing anything else at it:
 | Clinic search: insurance gate, batches of 3, stop-at-first-matching-batch, nearest-within-batch | **Real, tested** — `workflow/clinic_call.py::search_clinics()` |
 | Calendar intersection (clinic slots ∩ user availability) | **Real, tested** — `workflow/calendar.py::matched_slots()` |
 | Family as an ordered, call-only list checked after the clinic match | **Real, tested** — `workflow/family_call.py` |
-| Freelance batches of 3, cheapest-by-rate within the batch, non-binding ask then one binding confirm, decline→retry inside that batch | **Real, tested** — `workflow/interpreter_matching.py` |
+| Freelance batches of `DEFAULT_BATCH_SIZE` (2), cheapest-by-rate within the batch, non-binding ask then one binding confirm, decline→retry inside that batch. Dialled one after another by default (`PARALLEL_BATCH_CALLS`/`SIGNCALL_FREELANCE_PARALLEL_BATCH` off) since a shared CALL-E line only runs one call at a time; both batch members are still always asked either way | **Real, tested** — `workflow/interpreter_matching.py` |
 | Clinic booking-success verification | **Real, tested** — `workflow/clinic_call.py::_require_booked()`; note the commit ordering it used to protect has been deliberately traded away (see Known limitations) |
 | CALL-E adapter, real SDK calls, mock mode | **Real, exercised against a live account twice** (2026-09-13) — found and fixed two response-mapping bugs; see `calle/run.py` |
 | Interpreter roster | **Real, tested, and synthetic on purpose** — `data/interpreters_nv.json` via `interpreter_matching.load_candidates_within_radius()`; 30 invented interpreters, 15 in Las Vegas, reserved 555-01xx numbers |
 | Final confirmation text to the user and the secured interpreter | **Composed for real, delivery stubbed** — `reminders.send_confirmation_text()` raises; `appointment.py` catches it and records the exact undelivered message in `evidence` rather than failing a run whose appointment is genuinely booked |
+| User-initiated cancellation of a succeeded booking | **Real, tested** — `POST /runs/{id}/cancel`; `workflow/appointment.py::cancel_appointment()` calls the clinic to cancel, then releases whoever was interpreting (family or freelance; nobody for a user-arranged interpreter). Retriable from `cancel_failed`. Works from a stored result alone — no live objects from the original run needed |
 | Adding the booking to the user's calendar | **Not implemented** — the design names no mechanism, so none was invented |
 | ASL recognizer | **Not started here** — being built separately; contract documented above |
 | HTTP endpoint for the frontend | **Real, tested** — `api/server.py`; validated in-process by the `api_endpoint` scenario and against a live uvicorn server |

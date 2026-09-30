@@ -708,14 +708,14 @@ function describeInterpreter(interpreter) {
   return `${interpreter.name}: $${interpreter.rate_per_hour}/hr${minimum}${total}`;
 }
 
-function startTracking(runId, plan) {
+function startTracking(runId, plan, progressTitle, progressText) {
   stopTracking();
   Object.assign(tracking, { id: runId, failures: 0, screen: null, answered: false, declinedByUser: false });
   try { localStorage.setItem(ACTIVE_RUN_KEY, runId); } catch (e) { /* private mode: tracking just won't survive a refresh */ }
   document.getElementById("progressPlanText").textContent = plan;
   showProgress(
-    "Finding your appointment",
-    "Calling clinics and interpreters. This can take a few minutes. Keep this page open -- we'll ask you before anything is booked.",
+    progressTitle || "Finding your appointment",
+    progressText || "Calling clinics and interpreters. This can take a few minutes. Keep this page open -- we'll ask you before anything is booked.",
   );
   pollBooking();
   tracking.timer = setInterval(pollBooking, POLL_INTERVAL_MS);
@@ -755,7 +755,9 @@ async function pollBooking() {
   if (booking.status === "awaiting_confirmation") {
     // Once answered, ignore a stale poll that still says "awaiting".
     if (!tracking.answered && tracking.screen !== "confirm") showConfirm(booking.proposal);
-  } else if (booking.status !== "running") {
+  } else if (booking.status === "running" || booking.status === "cancelling") {
+    // Still in progress -- keep polling, the progress screen is already showing.
+  } else {
     forgetRun();
     showOutcome(booking);
   }
@@ -816,8 +818,11 @@ async function answerProposal(approved) {
   }
 }
 
+let doneBookingId = null;
+
 function showOutcome(booking) {
   document.title = APP_TITLE;
+  doneBookingId = booking.run_id;
   const proposal = booking.proposal;
   const result = booking.result;
   let title = "Request sent";
@@ -842,6 +847,19 @@ function showOutcome(booking) {
     title = "We couldn't finish this";
     sub = booking.error || "Something went wrong while booking.";
     kind = "stop";
+  } else if (booking.status === "cancelled") {
+    title = "Appointment cancelled";
+    sub = proposal ? `${proposal.clinic_name}, ${formatWhen(proposal.date, proposal.time)}` : "Your appointment has been cancelled.";
+    const cancellation = booking.cancellation || {};
+    rows.push(["Clinic", cancellation.clinic_cancelled
+      ? "Confirmed the cancellation"
+      : "Did NOT confirm the cancellation -- call them directly to make sure"]);
+    if (cancellation.interpreter_released === true) rows.push(["Interpreter", "Called and told the engagement is cancelled"]);
+    else if (cancellation.interpreter_released === false) rows.push(["Interpreter", "Nobody to notify"]);
+  } else if (booking.status === "cancel_failed") {
+    title = "Couldn't cancel";
+    sub = booking.error || "Something went wrong while cancelling -- your appointment is still booked.";
+    kind = "stop";
   }
 
   document.getElementById("doneTitle").textContent = title;
@@ -850,9 +868,18 @@ function showOutcome(booking) {
   fillRows(document.getElementById("doneDetails"), rows);
   fillList(document.getElementById("doneRequirements"), document.getElementById("doneRequirementsList"), (result && result.requirements) || []);
   fillList(document.getElementById("doneNotes"), document.getElementById("doneNotesList"), (result && result.notes) || []);
+  hideBanner("cancelError");
+  const btnCancel = document.getElementById("btnCancelAppointment");
+  const canCancel = booking.status === "succeeded" || booking.status === "cancel_failed";
+  btnCancel.hidden = !canCancel;
+  btnCancel.disabled = false;
+  btnCancel.textContent = booking.status === "cancel_failed" ? "Try cancelling again" : "Cancel appointment";
   tracking.screen = "done";
   showScreen("done");
 }
+
+const CANCELLING_TITLE = "Cancelling your appointment";
+const CANCELLING_TEXT = "Calling the clinic, then your interpreter, to let them know. This can take a minute or two.";
 
 // A refresh mid-run shouldn't lose the request: pick it back up, or show how
 // it ended while the page was closed. Returns whether it took over the screen.
@@ -862,7 +889,9 @@ async function resumeActiveRun() {
   if (!runId) return false;
   try {
     const booking = await fetchBooking(runId);
-    if (booking.status === "running" || booking.status === "awaiting_confirmation") {
+    if (booking.status === "cancelling") {
+      startTracking(runId, "", CANCELLING_TITLE, CANCELLING_TEXT);
+    } else if (booking.status === "running" || booking.status === "awaiting_confirmation") {
       startTracking(runId, "");
     } else {
       forgetRun();
@@ -882,6 +911,27 @@ function wireConfirm() {
 
 // --------------------------------------------------------------- done --
 
+async function onCancelAppointment() {
+  if (!doneBookingId) return;
+  const confirmed = window.confirm(
+    "Cancel this appointment? We'll call the clinic to cancel, and call your interpreter(only if we found and called one for you) to let them know it's off.",
+  );
+  if (!confirmed) return;
+
+  hideBanner("cancelError");
+  const btn = document.getElementById("btnCancelAppointment");
+  btn.disabled = true;
+  const runId = doneBookingId;
+  try {
+    await apiPostJson(`/bookings/${encodeURIComponent(runId)}/cancel`, { user_id: state.userId });
+  } catch (e) {
+    btn.disabled = false;
+    showBanner("cancelError", e.message || "Couldn't cancel -- please try again.");
+    return;
+  }
+  startTracking(runId, "", CANCELLING_TITLE, CANCELLING_TEXT);
+}
+
 function wireDone() {
   document.getElementById("btnBookAnother").addEventListener("click", () => {
     forgetRun();
@@ -891,6 +941,7 @@ function wireDone() {
     updateUseButtonState();
     showScreen("inputMethod");
   });
+  document.getElementById("btnCancelAppointment").addEventListener("click", onCancelAppointment);
 }
 
 // --------------------------------------------------------------- wire-up --

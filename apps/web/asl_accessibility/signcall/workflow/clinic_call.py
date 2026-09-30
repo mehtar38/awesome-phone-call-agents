@@ -77,13 +77,30 @@ CLINIC_BOOK_SCHEMA = {
     "type": "object",
     "properties": {
         "booked": {"type": "boolean"},
+        "confirmed_date": {
+            "type": "string",
+            "description": (
+                "YYYY-MM-DD. Only set when booked=true, and must be the exact "
+                "date that was asked for -- never a different date the clinic "
+                "offered instead."
+            ),
+        },
+        "confirmed_time": {
+            "type": "string",
+            "description": (
+                "24-hour HH:MM. Only set when booked=true, and must be the "
+                "exact time that was asked for -- never a different time the "
+                "clinic offered instead."
+            ),
+        },
         "confirmed_by": {"type": "string"},
         "booking_reference": {"type": "string"},
         "blocked_reason": {
             "type": "string",
             "description": (
-                "If the clinic would not book, why (for example it needs a "
-                "referral first). Empty if it booked."
+                "If the clinic would not book the exact requested date and "
+                "time -- including because it offered a DIFFERENT date or "
+                "time instead -- why. Empty if it booked the exact slot asked for."
             ),
         },
         "requirements": _REQUIREMENTS_FIELD,
@@ -204,7 +221,14 @@ def book_slot(clinic: ClinicCandidate, slot: ClinicSlot, user: UserInput) -> dic
 
     This is the one clinic call that identifies the patient: the clinic is
     given the name, date of birth, age, phone and insurance details it needs
-    to put an appointment in its book."""
+    to put an appointment in its book.
+
+    The user approved a SPECIFIC date and time -- everyone downstream
+    (family, interpreter, the confirmation texts) is told exactly that slot,
+    not whatever the clinic ends up actually booking. So a different date or
+    time offered on this call is refused outright, not accepted as a
+    substitute: see the task text and _require_booked() below.
+    """
     informed = (
         f"When we checked availability, the clinic said these are required for "
         f"the appointment: {'; '.join(clinic.requirements)}. The patient has "
@@ -217,57 +241,104 @@ def book_slot(clinic: ClinicCandidate, slot: ClinicSlot, user: UserInput) -> dic
         "Start by saying: 'I am calling on behalf of a deaf or hard of hearing "
         "person. We called earlier to check availability, and we would like to "
         "book the appointment.' "
-        f"Book the {slot.date} {slot.time} appointment. "
+        f"Book the {slot.date} {slot.time} appointment -- and ONLY that "
+        f"exact date and time, no other. "
         "Give them the patient's details when they ask for them: "
         f"{user.patient_summary()}. "
         f"{informed}"
-        "If the clinic will not book until something is done first, do not "
-        "book: thank them, end the call, and give the reason. Otherwise book "
-        "it, and list anything the clinic says is still outstanding. "
-        "Confirm the booking is actually made and get the name of whoever "
-        "confirmed it, plus a booking reference if they have one."
+        f"If {slot.date} {slot.time} is not available, or the clinic offers "
+        f"any OTHER date or time instead, do NOT accept, hold, or book that "
+        f"alternative under any circumstances. Treat this exactly like a "
+        f"refusal to book at all: thank them, end the call, and put the "
+        f"reason in blocked_reason -- if they offered a different date or "
+        f"time, say so there and name it, so the patient can decide for "
+        f"themselves whether to take it. "
+        "Only if they can book that exact date and time: confirm the "
+        "booking is actually made, return the date and time they confirmed "
+        "as confirmed_date (YYYY-MM-DD) and confirmed_time (24-hour HH:MM) "
+        "-- these must match what was asked for -- get the name of whoever "
+        "confirmed it and a booking reference if they have one, and list "
+        "anything the clinic says is still outstanding."
     )
     result = call_and_wait(
         task, clinic.phone, CLINIC_BOOK_SCHEMA, purpose=CallPurpose.CLINIC_BOOK
     )
-    _require_booked(result, f"{slot.date} {slot.time}")
+    _require_booked(result, slot)
     return result.structured_result
 
 
-def _require_booked(result, slot_description: str) -> None:
+def _require_booked(result, slot: ClinicSlot) -> None:
     """A failed, voicemail'd, or declined clinic call must never be treated
-    as a successful booking. The clinic is booked before any interpreter is
-    asked to commit, so a failure here leaves nothing to undo."""
-    if result.task_completed and result.structured_result.get("booked"):
+    as a successful booking -- and neither may a booking for a DIFFERENT date
+    or time than the one the user actually approved, even if the clinic
+    agent reports booked=true. A real, confirmed bug: the calling agent once
+    accepted a clinic's alternate-day offer and reported success, and nothing
+    here checked WHICH day was actually confirmed -- the workflow went on to
+    tell the interpreter and the user about the original, never-booked slot.
+
+    The clinic is booked before any interpreter is asked to commit, so a
+    failure here leaves nothing of OURS to undo -- but the clinic's own
+    system may already reflect the alternate slot from earlier in the same
+    call, which is called out explicitly below."""
+    structured = result.structured_result
+    booked = bool(result.task_completed and structured.get("booked"))
+    confirmed_date = structured.get("confirmed_date")
+    confirmed_time = structured.get("confirmed_time")
+    mismatched = booked and (
+        (isinstance(confirmed_date, str) and confirmed_date != slot.date)
+        or (isinstance(confirmed_time, str) and confirmed_time != slot.time)
+    )
+    if booked and not mismatched:
         return
-    detail = "Nothing was booked and no interpreter was confirmed, so nothing needs cancelling."
-    reason = result.structured_result.get("blocked_reason")
+
+    slot_description = f"{slot.date} {slot.time}"
+    if mismatched:
+        detail = (
+            f"REJECTED: the clinic reported booking "
+            f"{confirmed_date or slot.date} {confirmed_time or slot.time} "
+            f"instead -- only the exact requested time may be accepted, so "
+            f"this is treated as not booked. No interpreter was confirmed. "
+            f"If the clinic's own system was already updated during the "
+            f"call, call them directly to make sure nothing is on their "
+            f"books for the wrong day."
+        )
+    else:
+        detail = "Nothing was booked and no interpreter was confirmed, so nothing needs cancelling."
+    reason = structured.get("blocked_reason")
     clinic_said = f" The clinic said: {reason.strip()}." if isinstance(reason, str) and reason.strip() else ""
-    still_needed = clean_strings(result.structured_result.get("requirements"))
+    still_needed = clean_strings(structured.get("requirements"))
     needed = f" Still required before they will book: {'; '.join(still_needed)}." if still_needed else ""
     raise RuntimeError(
         f"Clinic booking for {slot_description} did not succeed "
         f"(task_completed={result.task_completed}, "
-        f"booked={result.structured_result.get('booked')!r}).{clinic_said}{needed} {detail}"
+        f"booked={structured.get('booked')!r}).{clinic_said}{needed} {detail}"
     )
 
 
 def cancel_booking(
     clinic: ClinicCandidate,
     slot: ClinicSlot,
-    user: UserInput,
+    patient_name: str,
     booking_reference: str | None = None,
 ) -> bool:
-    """Undoes a booking made by book_slot(), for when every freelance
-    interpreter declines the final confirmation and the appointment they were
-    meant to cover shouldn't stand. Returns whether the clinic confirmed the
-    cancellation, so the caller can tell the user if it didn't."""
+    """Undoes a booking made by book_slot() -- either because every
+    interpreter who might have covered it (family, then freelance) declined
+    the final confirmation, or because the user cancelled an already-booked
+    appointment outright (see appointment.cancel_appointment()). Returns
+    whether the clinic confirmed the cancellation, so the caller can tell
+    the user if it didn't.
+
+    Takes `patient_name` rather than a full UserInput: this is the one piece
+    of the patient's identity a cancel call actually needs, and a
+    user-initiated cancellation may run long after the original UserInput
+    object existed -- only the succeeded run's own stored result survives
+    that long (see cancel_appointment()'s docstring)."""
     reference = f", booking reference {booking_reference}" if booking_reference else ""
     task = (
         "Start by saying: 'I am calling on behalf of a deaf or hard of hearing "
         "person. We booked an appointment with you earlier and need to cancel "
         "it.' "
-        f"Cancel the {slot.date} {slot.time} appointment for {user.name}{reference}. "
+        f"Cancel the {slot.date} {slot.time} appointment for {patient_name}{reference}. "
         "Confirm it is actually cancelled."
     )
     result = call_and_wait(

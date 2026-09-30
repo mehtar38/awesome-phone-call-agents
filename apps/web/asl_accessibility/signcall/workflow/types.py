@@ -134,6 +134,17 @@ class ClinicCandidate:
     # Informational: it never changes which clinic is chosen.
     requirements: list[str] = field(default_factory=list)
     notes: str | None = None
+    # Optional: a street address, when the source actually has one (the live
+    # Google Maps listing does; the synthetic fallback and injected test
+    # clinics don't, so this is never assumed present). Not part of the
+    # 4-field record contract -- see schemas/clinic_record.schema.json.
+    address: str | None = None
+
+    def location_description(self) -> str:
+        """What an interpreter or family member is told about where the
+        appointment is -- a real street address if one is on file, otherwise
+        the best we actually have (name + ZIP), never a guess."""
+        return self.address if self.address else f"{self.name}, ZIP {self.zipcode}"
 
 
 @dataclass
@@ -193,6 +204,15 @@ class AppointmentResult:
     family_tier_result: str  # "locked_in" | "no_overlap" | "not_registered"
     interpreter_source: str  # "family" | "freelance" | "user_arranged"
     cancellation_deadline: str | None
+    # Who to call to actually cancel later, and what slot was booked -- kept
+    # here (not just in evidence text) because a user-initiated cancellation
+    # can happen long after the original ClinicCandidate/ClinicSlot objects
+    # are gone; this dict round-trips through JSON (API response -> the
+    # frontend's own stored record -> back to this server) with everything
+    # appointment.cancel_appointment() needs, and nothing more sensitive
+    # than what interpreter/evidence below already carry.
+    clinic_contact: dict = field(default_factory=dict)  # {name, phone, zipcode, address}
+    appointment_slot: dict = field(default_factory=dict)  # {date, time}
     evidence: list[str] = field(default_factory=list)
     # Things the clinic said are required for the appointment (a referral,
     # ID, forms) -- for the user to act on. Never blocks a booking by itself.

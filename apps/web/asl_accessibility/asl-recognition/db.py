@@ -68,17 +68,23 @@ def init_db():
         conn.execute("ALTER TABLE bookings RENAME TO bookings_legacy")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
-            run_id         TEXT PRIMARY KEY,
-            user_id        TEXT,
-            status         TEXT NOT NULL DEFAULT 'running',
-            proposal_json  TEXT,
-            result_json    TEXT,
-            error          TEXT,
-            reason         TEXT,
-            created_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            run_id             TEXT PRIMARY KEY,
+            user_id            TEXT,
+            status             TEXT NOT NULL DEFAULT 'running',
+            proposal_json      TEXT,
+            result_json        TEXT,
+            error              TEXT,
+            reason             TEXT,
+            cancellation_json  TEXT,
+            created_at         TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at         TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # `cancellation_json` was added after this table may already exist on
+    # disk, same reason as the `phone` patch above.
+    booking_cols = {row["name"] for row in conn.execute("PRAGMA table_info(bookings)")}
+    if "cancellation_json" not in booking_cols:
+        conn.execute("ALTER TABLE bookings ADD COLUMN cancellation_json TEXT")
     conn.commit()
     conn.close()
 
@@ -118,6 +124,7 @@ def get_profile(user_id: str):
 # --- bookings ---------------------------------------------------------------
 #
 # status: running -> awaiting_confirmation -> running -> succeeded | declined | failed
+#         succeeded -> cancelling -> cancelled | cancel_failed (user-initiated only)
 #
 # The workflow's notifications can arrive before /submit-booking has recorded
 # who the run belongs to (a fast run finishes in milliseconds), so every write
@@ -178,6 +185,27 @@ def resolve_confirmation(run_id: str, approved: bool):
         """, ("running" if approved else "declined", run_id))
 
 
+def record_cancelling(run_id: str):
+    """The user asked to cancel a booking; the workflow is placing the
+    cancel/release calls now. Moves a booking that's succeeded, or retrying
+    after a failed cancel attempt -- nothing else has anything to cancel."""
+    with _transaction() as conn:
+        conn.execute("""
+            UPDATE bookings SET status='cancelling', updated_at=CURRENT_TIMESTAMP
+            WHERE run_id=? AND status IN ('succeeded', 'cancel_failed')
+        """, (run_id,))
+
+
+def record_cancellation(run_id: str, status: str, cancellation=None, error=None):
+    """How the cancellation ended: cancelled or cancel_failed. Only moves a
+    booking that's actually cancelling, same reasoning as record_cancelling."""
+    with _transaction() as conn:
+        conn.execute("""
+            UPDATE bookings SET status=?, cancellation_json=?, error=?, updated_at=CURRENT_TIMESTAMP
+            WHERE run_id=? AND status='cancelling'
+        """, (status, json.dumps(cancellation) if cancellation is not None else None, error, run_id))
+
+
 def get_booking(run_id: str):
     conn = get_conn()
     row = conn.execute("SELECT * FROM bookings WHERE run_id = ?", (run_id,)).fetchone()
@@ -186,6 +214,8 @@ def get_booking(run_id: str):
         return None
     booking = dict(row)
     proposal, result = booking.pop("proposal_json"), booking.pop("result_json")
+    cancellation = booking.pop("cancellation_json")
     booking["proposal"] = json.loads(proposal) if proposal else None
     booking["result"] = json.loads(result) if result else None
+    booking["cancellation"] = json.loads(cancellation) if cancellation else None
     return booking

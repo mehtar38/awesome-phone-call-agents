@@ -237,7 +237,7 @@ def _create_call_with_concurrency_retry(client, **kwargs) -> dict:
 # assignment is STICKY: the clinic searched on line 2 is booked on line 2, and
 # an interpreter confirmed on line 3 was asked on line 3.
 
-DEMO_TEST_LINES = ("+18722794605", "+19496780146", "+19496780146")
+DEMO_TEST_LINES = ("+19496780146", "+19496780146", "+19496780146")
 
 _line_assignments: dict[str, str] = {}
 _routing_lock = threading.Lock()

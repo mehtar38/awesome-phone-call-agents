@@ -512,18 +512,38 @@ def confirm_booking_endpoint(run_id: str, payload: dict = Body(...)):
 
 @app.post("/bookings/{run_id}/cancel")
 def cancel_booking_endpoint(run_id: str, payload: dict = Body(...)):
-    """The user cancelling an already-booked appointment from the outcome
-    screen. Forwarded to the workflow, which places the real cancel/release
-    calls; the frontend then polls the same GET /bookings/{run_id} it already
-    uses, watching for status to move on from 'cancelling'."""
-    booking = _booking_for(run_id, payload.get("user_id"))
+    """The user cancelling an already-booked appointment -- from the outcome
+    screen right after booking, or from the booking-history list days later.
+    Forwarded to the workflow, which places the real cancel/release calls;
+    the frontend then polls the same GET /bookings/{run_id} it already uses,
+    watching for status to move on from 'cancelling'.
+
+    The workflow server keeps no durable storage of its own (see its
+    README/server.py docstring) -- a cancel request days after booking would
+    otherwise 404 against a process that's since restarted and forgotten the
+    run. So this sends the booking's own stored `result` (clinic contact,
+    interpreter, slot -- exactly what /submit-booking's outcome already gave
+    us) and the patient's name (from their profile, since bookings.py itself
+    never stores a name -- see db.py's module docstring) in the request
+    body. The workflow uses this to "adopt" the run if it doesn't already
+    know it, or prefers it over its own (possibly staler) copy if it does."""
+    user_id = payload.get("user_id")
+    booking = _booking_for(run_id, user_id)
     if booking["status"] not in ("succeeded", "cancel_failed"):
         raise HTTPException(409, "This booking has nothing to cancel right now.")
+    if not booking["result"]:
+        raise HTTPException(500, "This booking has no stored details to cancel it with.")
     if not BOOKING_WORKFLOW_URL:
         raise HTTPException(500, "BOOKING_WORKFLOW_URL is not set on the server")
 
+    profile = db.get_profile(user_id)
+    patient_name = (profile or {}).get("name")
+    if not patient_name:
+        raise HTTPException(500, "No profile on file to get the patient's name from.")
+
+    body = json.dumps({"result": booking["result"], "patient_name": patient_name}).encode("utf-8")
     req = urllib.request.Request(
-        _workflow_url(run_id, "cancel"), data=b"", method="POST",
+        _workflow_url(run_id, "cancel"), data=body, method="POST",
         headers={"Content-Type": "application/json"},
     )
     try:
@@ -538,6 +558,22 @@ def cancel_booking_endpoint(run_id: str, payload: dict = Body(...)):
 
     db.record_cancelling(run_id)
     return {"status": "cancelling"}
+
+
+@app.get("/bookings")
+def list_bookings_endpoint(user_id: str = Query(...)):
+    """The booking-history view: every booking this browser has ever
+    submitted, most recent first. Unlike GET /bookings/{run_id}, this never
+    live-syncs from the workflow -- only the one run actively being tracked
+    needs that; a history list is read from what's already stored."""
+    bookings = db.list_bookings(user_id)
+    return {
+        "bookings": [
+            {key: booking[key] for key in
+             ("run_id", "status", "proposal", "result", "error", "reason", "cancellation", "updated_at")}
+            for booking in bookings
+        ]
+    }
 
 
 # Serves static/index.html at GET / (and any other file under static/).

@@ -29,6 +29,11 @@ class BookingProposal:
     clinic_name: str
     clinic_zipcode: str
     clinic_distance_miles: float | None
+    # A real street address when the source has one (live Apify/Google Maps
+    # does; synthetic/injected clinics usually don't) -- same fallback as
+    # ClinicCandidate.location_description(), so the UI always has somewhere
+    # to send the user even without one.
+    clinic_address: str | None
     date: str  # YYYY-MM-DD
     time: str  # HH:MM, 24-hour
     # Same shape as AppointmentResult.interpreter: {"tier": "user_arranged"},

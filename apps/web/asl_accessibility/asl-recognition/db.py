@@ -17,8 +17,11 @@ Two things persist here:
   - one `bookings` row per submitted request: where it is in the workflow, the
     proposal the user was asked to approve, and how it ended. The workflow
     reports each of those to /notifications (see app.py), and the browser
-    reads them back from here. The row is also the record the future
-    cancel/reschedule flow will look appointments up in.
+    reads them back from here. This row is also what a cancellation looks
+    appointment details up in: the signcall workflow server keeps no
+    durable storage of its own (see its README), so a cancel request sends
+    this row's own stored `result` (clinic contact, interpreter, slot) back
+    to it, rather than asking it to still remember a run from days ago.
 """
 import json
 import sqlite3
@@ -206,12 +209,7 @@ def record_cancellation(run_id: str, status: str, cancellation=None, error=None)
         """, (status, json.dumps(cancellation) if cancellation is not None else None, error, run_id))
 
 
-def get_booking(run_id: str):
-    conn = get_conn()
-    row = conn.execute("SELECT * FROM bookings WHERE run_id = ?", (run_id,)).fetchone()
-    conn.close()
-    if not row:
-        return None
+def _decode_booking(row) -> dict:
     booking = dict(row)
     proposal, result = booking.pop("proposal_json"), booking.pop("result_json")
     cancellation = booking.pop("cancellation_json")
@@ -219,3 +217,25 @@ def get_booking(run_id: str):
     booking["result"] = json.loads(result) if result else None
     booking["cancellation"] = json.loads(cancellation) if cancellation else None
     return booking
+
+
+def get_booking(run_id: str):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM bookings WHERE run_id = ?", (run_id,)).fetchone()
+    conn.close()
+    return _decode_booking(row) if row else None
+
+
+def list_bookings(user_id: str) -> list[dict]:
+    """Every booking this browser has ever submitted, most recent first --
+    the booking-history view, and how a booking made days ago can still be
+    found and cancelled: its run_id no longer needs to be the one remembered
+    in localStorage, since this lists all of them by user_id instead. No
+    pagination or row cap -- a single local SQLite file isn't going to
+    accumulate enough rows from one browser to need it."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM bookings WHERE user_id = ? ORDER BY updated_at DESC", (user_id,)
+    ).fetchall()
+    conn.close()
+    return [_decode_booking(row) for row in rows]

@@ -25,7 +25,7 @@
     "zipcode": {
       "type": "string",
       "pattern": "^[0-9]{5}$",
-      "description": "5-digit US ZIP. This build's clinic-distance table and interpreter roster cover Nevada only; a non-NV ZIP is rejected at parse time, not here."
+      "description": "5-digit US ZIP. This build's clinic-distance table covers Nevada and Illinois only (see workflow/user_input.py::COVERED_STATES); a ZIP outside both is rejected at parse time, not here."
     },
     "appointment_type": {
       "type": "string",

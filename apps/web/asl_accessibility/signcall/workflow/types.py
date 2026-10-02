@@ -127,7 +127,7 @@ class ClinicCandidate:
     zipcode: str
     clinic_type: str
     distance_miles: float | None = None
-    source: str = "apify_google_maps"  # "apify_google_maps" | "fallback_snapshot" | "injected"
+    source: str = "apify_google_maps"  # "apify_google_maps" | "injected"
     accepts_insurance: bool | None = None
     offered_slots: list[ClinicSlot] = field(default_factory=list)
     # What the clinic said is needed to book or attend (a referral, ID, forms).
@@ -149,8 +149,11 @@ class ClinicCandidate:
 
 @dataclass
 class InterpreterCandidate:
-    """One freelance interpreter from the seeded roster, before and after the
-    batched search contacts them."""
+    """One freelance interpreter, before and after the batched search
+    contacts them. Two sources: workflow/interpreter_lookup.py's live
+    Illinois registry lookup for an Illinois clinic, or
+    workflow/interpreter_matching.py's seeded synthetic roster everywhere
+    else covered; `candidates` can still be injected directly for tests."""
 
     name: str
     phone: str
@@ -160,6 +163,7 @@ class InterpreterCandidate:
     expertise: list[str] = field(default_factory=list)  # stored and surfaced;
                                                           # never used to filter
     distance_miles: float | None = None
+    source: str = "seeded_roster"  # "seeded_roster" | "il_directory" | "injected"
     # Populated only after they actually respond -- never assumed upfront, and
     # never stored in the roster, since real rates aren't public.
     rate_per_hour: float | None = None

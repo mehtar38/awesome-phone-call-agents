@@ -385,3 +385,16 @@ canvas#captureCanvas { display: none; }
 }
 .notice ul { margin: 0; padding-left: 18px; line-height: 1.5; }
 .notice li + li { margin-top: 4px; }
+
+/* ---------- collapsible secondary detail (rate breakdown, alternates,
+   requirements, notes) -- kept out of the main view by default so the
+   essentials (date, time, clinic, interpreter) aren't buried in text. ---------- */
+.more-details { margin: 4px 0 16px; }
+.more-details summary {
+  cursor: pointer; font-weight: 600; color: var(--primary);
+  padding: 10px 0; list-style: none;
+}
+.more-details summary::-webkit-details-marker { display: none; }
+.more-details summary::after { content: "Show"; float: right; font-weight: 500; color: var(--text-muted); font-size: 0.85rem; }
+.more-details[open] summary::after { content: "Hide"; }
+.more-details[open] summary { border-bottom: 1px solid var(--border); margin-bottom: 4px; }

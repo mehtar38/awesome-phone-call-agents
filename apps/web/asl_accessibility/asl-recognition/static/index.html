@@ -135,7 +135,20 @@
 
     <div class="actions">
       <button id="btnUseTranscript" class="btn btn-primary" disabled>Use this</button>
+      <button id="btnViewHistory" class="btn btn-text">My bookings</button>
       <button id="btnEditProfile" class="btn btn-text">Edit my profile</button>
+    </div>
+  </section>
+
+  <!-- ================= BOOKING HISTORY ================= -->
+  <section id="history" class="screen">
+    <h1>My bookings</h1>
+    <p class="hint">Every request you've submitted, most recent first.</p>
+    <div id="historyError" class="banner error" role="alert"></div>
+    <div id="historyList"></div>
+    <p id="historyEmpty" class="hint" hidden>Nothing here yet.</p>
+    <div class="actions">
+      <button id="btnHistoryBack" class="btn btn-text">Back</button>
     </div>
   </section>
 
@@ -188,10 +201,17 @@
       <h1 id="progressTitle">Finding your appointment</h1>
       <p class="hint" id="progressText" role="status" aria-live="polite"></p>
     </div>
-    <div class="field">
-      <label>What we're doing</label>
+    <p class="hint" id="progressSummaryText" style="margin:0 0 4px;"></p>
+
+    <!-- The full call-by-call plan (what's shared, with whom, on which call)
+         stays available -- nothing here is hidden -- but isn't forced reading
+         by default. See AGENTS.md phone-call safety rules: explicit user
+         intent / consent still has to be satisfiable, just not at the cost of
+         a wall of English prose on every single run. -->
+    <details id="progressMore" class="more-details" hidden>
+      <summary>Full details</summary>
       <p class="hint" id="progressPlanText" style="margin:0;"></p>
-    </div>
+    </details>
   </section>
 
   <!-- ================= CONFIRM (YOUR GO / NO-GO) ================= -->
@@ -202,14 +222,18 @@
 
     <div id="confirmDetails"></div>
 
-    <div id="confirmRequirements" class="notice" hidden>
-      <div class="notice-title">Required for this appointment</div>
-      <ul id="confirmRequirementsList"></ul>
-    </div>
-    <div id="confirmNotes" class="notice notice-muted" hidden>
-      <div class="notice-title">Also mentioned on the calls</div>
-      <ul id="confirmNotesList"></ul>
-    </div>
+    <details id="confirmMore" class="more-details" hidden>
+      <summary>More details</summary>
+      <div id="confirmMoreDetails"></div>
+      <div id="confirmRequirements" class="notice" hidden>
+        <div class="notice-title">Required for this appointment</div>
+        <ul id="confirmRequirementsList"></ul>
+      </div>
+      <div id="confirmNotes" class="notice notice-muted" hidden>
+        <div class="notice-title">Also mentioned on the calls</div>
+        <ul id="confirmNotesList"></ul>
+      </div>
+    </details>
 
     <div class="actions">
       <button id="btnApprove" class="btn btn-primary">Yes, book it</button>
@@ -230,14 +254,18 @@
 
     <div id="doneDetails"></div>
 
-    <div id="doneRequirements" class="notice" hidden>
-      <div class="notice-title">Required for this appointment</div>
-      <ul id="doneRequirementsList"></ul>
-    </div>
-    <div id="doneNotes" class="notice notice-muted" hidden>
-      <div class="notice-title">Also mentioned on the calls</div>
-      <ul id="doneNotesList"></ul>
-    </div>
+    <details id="doneMore" class="more-details" hidden>
+      <summary>More details</summary>
+      <div id="doneMoreDetails"></div>
+      <div id="doneRequirements" class="notice" hidden>
+        <div class="notice-title">Required for this appointment</div>
+        <ul id="doneRequirementsList"></ul>
+      </div>
+      <div id="doneNotes" class="notice notice-muted" hidden>
+        <div class="notice-title">Also mentioned on the calls</div>
+        <ul id="doneNotesList"></ul>
+      </div>
+    </details>
 
     <div id="cancelError" class="banner error" role="alert"></div>
 

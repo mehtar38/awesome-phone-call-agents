@@ -106,7 +106,7 @@ prose before or after it, matching this schema exactly:
   "availability": [
     {{"day": "Tuesday", "date": "YYYY-MM-DD", "time": "HH:MM"}}
   ],
-  "clinic_type_hint": "physical_therapy" | "mental_health" | "general" | "ent" | "dentist" | null,
+  "clinic_type_hint": "physical_therapy" | "eyes" | "mental" | "general" | "ent" | "dental" | null,
   "wants_interpreter": true | false | null
 }}
 

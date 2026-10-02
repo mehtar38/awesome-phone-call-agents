@@ -32,7 +32,7 @@ from typing import NoReturn
 
 from ..calle.run import reset_call_routing
 
-from . import calendar, clinic_call, clinic_lookup, family_call, interpreter_matching, reminders
+from . import calendar, clinic_call, clinic_lookup, family_call, interpreter_lookup, interpreter_matching, reminders
 from .confirmation import ApprovalFn, BookingDeclined, BookingProposal
 from .types import (
     AppointmentResult,
@@ -44,8 +44,6 @@ from .types import (
     append_note,
     clean_strings,
 )
-
-INTERPRETER_RADIUS_MILES = 15.0
 
 
 @dataclass
@@ -221,13 +219,23 @@ def _resolve_freelance_pool(
     clinic: ClinicCandidate, candidates: list[InterpreterCandidate] | None
 ) -> list[InterpreterCandidate]:
     """`candidates` is the caller-supplied pool (tests inject one), or None,
-    meaning "go find them" in the seeded roster. Shared by the initial
-    freelance search and the family-confirm fallback so both ever look at
-    the same pool for a given run."""
+    meaning "go find them": an Illinois clinic looks up Illinois's own live
+    interpreter registry (interpreter_lookup.find_interpreters_il()).
+    Everywhere else covered has no real interpreter source yet, so this
+    returns an empty pool rather than substituting fabricated interpreters --
+    _arrange_freelancer() turns an empty pool into a clear "no interpreter
+    could be found" error, which is the honest outcome when there's nothing
+    real to offer, not a fake name and number that looks like a real match.
+    (interpreter_matching.load_candidates_within_radius() -- the old seeded
+    synthetic roster -- still exists and is still tested, but only as a test
+    fixture for the matching algorithm; nothing in a live run calls it.)
+    Shared by the initial freelance search and the family-confirm fallback
+    so both ever look at the same pool for a given run."""
     if candidates is None:
-        candidates = interpreter_matching.load_candidates_within_radius(
-            clinic.zipcode, INTERPRETER_RADIUS_MILES
-        )
+        if interpreter_lookup.is_illinois_zip(clinic.zipcode):
+            candidates = interpreter_lookup.find_interpreters_il(clinic.zipcode)
+        else:
+            candidates = []
     return candidates
 
 
@@ -243,9 +251,8 @@ def _arrange_freelancer(
     candidates = _resolve_freelance_pool(clinic, candidates)
     if not candidates:
         raise RuntimeError(
-            f"No interpreter in the roster is within {INTERPRETER_RADIUS_MILES} "
-            f"miles of {clinic.name} ({clinic.zipcode}) -- nobody was called, "
-            f"and no clinic appointment was taken."
+            f"No interpreter could be found for {clinic.name} ({clinic.zipcode}) "
+            f"-- nobody was called, and no clinic appointment was taken."
         )
 
     ranked = interpreter_matching.search_freelancers_in_batches(
@@ -284,6 +291,7 @@ def _freelancer_detail(candidate: InterpreterCandidate) -> dict:
         "minimum_hours": candidate.minimum_hours,
         "total_estimate": candidate.total_cost(),
         "expertise": candidate.expertise,
+        "source": candidate.source,  # "seeded_roster" | "il_directory" | "injected"
     }
 
 
@@ -316,6 +324,7 @@ def _build_proposal(clinic: ClinicCandidate, arrangement: _Arrangement) -> Booki
         clinic_name=clinic.name,
         clinic_zipcode=clinic.zipcode,
         clinic_distance_miles=clinic.distance_miles,
+        clinic_address=clinic.address,
         date=arrangement.slot.date,
         time=arrangement.slot.time,
         interpreter=_interpreter_detail(arrangement),

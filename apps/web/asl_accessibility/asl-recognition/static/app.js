@@ -10,12 +10,16 @@
 
 // ---------------------------------------------------------------- state --
 
+// value must match signcall's AppointmentType enum (workflow/types.py)
+// exactly -- a mismatch here passes schema validation client-side but gets
+// rejected by signcall with a 400 the moment the booking is submitted.
 const CLINIC_TYPES = [
   { value: "physical_therapy", label: "Physical Therapy" },
-  { value: "mental_health", label: "Mental Health" },
+  { value: "eyes", label: "Eyes" },
+  { value: "mental", label: "Mental Health" },
   { value: "general", label: "General" },
   { value: "ent", label: "ENT" },
-  { value: "dentist", label: "Dentist" },
+  { value: "dental", label: "Dentist" },
 ];
 
 const SETUP_STEPS = ["profileMethod", "profileData", "profileVerify", "familyList", "familyVerify"];
@@ -383,6 +387,7 @@ function wireInputMethod() {
   document.getElementById("typedInput").addEventListener("input", updateUseButtonState);
   document.getElementById("btnEditProfile").addEventListener("click", () => showScreen("profileVerify"));
   document.getElementById("btnUseTranscript").addEventListener("click", onUseTranscript);
+  document.getElementById("btnViewHistory").addEventListener("click", openHistory);
 
   wireSignCamera();
 }
@@ -645,7 +650,11 @@ async function onSubmitBooking() {
     const result = await apiPostJson("/submit-booking", payload);
     hideLoading();
     if (result && result.run_id) {
-      startTracking(result.run_id, result.plan || "");
+      const clinicLabel = (CLINIC_TYPES.find((c) => c.value === clinic_type) || {}).label || clinic_type;
+      const summary = state.booking.has_interpreter
+        ? `Looking for a ${clinicLabel} appointment near ${zipcode}.`
+        : `Looking for a ${clinicLabel} appointment near ${zipcode}, plus an ASL interpreter for it.`;
+      startTracking(result.run_id, result.plan || "", null, null, summary);
     } else {
       showOutcome({ status: "sent" });
     }
@@ -700,6 +709,18 @@ function formatWhen(date, time) {
   return when.toLocaleString(undefined, { weekday: "long", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 
+function formatDate(date) {
+  const when = new Date(`${date}T00:00`);
+  return isNaN(when) ? date : when.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+}
+
+function formatTime(time) {
+  const when = new Date(`2000-01-01T${time}`);
+  return isNaN(when) ? time : when.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+}
+
+// The full picture (rate, minimum hours, estimate) -- used in "More details",
+// not the main summary line. See describeInterpreterStatus() for that.
 function describeInterpreter(interpreter) {
   if (!interpreter || interpreter.tier === "user_arranged") return "Your own interpreter";
   if (interpreter.tier === "family") return `${interpreter.name} (${interpreter.relation})`;
@@ -708,11 +729,51 @@ function describeInterpreter(interpreter) {
   return `${interpreter.name}: $${interpreter.rate_per_hour}/hr${minimum}${total}`;
 }
 
-function startTracking(runId, plan, progressTitle, progressText) {
+// One short line for the main summary: who, and whether they're actually
+// locked in yet. `confirmed` only ever appears on a SUCCEEDED run's own
+// result -- a pre-approval proposal's interpreter never has it, so this
+// correctly reads as "found, not yet confirmed" there.
+function describeInterpreterStatus(interpreter) {
+  if (!interpreter || interpreter.tier === "user_arranged") return "Your own interpreter";
+  if (interpreter.tier === "family") {
+    return interpreter.confirmed ? `${interpreter.name} (${interpreter.relation}) -- confirmed` : `${interpreter.name} (${interpreter.relation})`;
+  }
+  return interpreter.confirmed ? `${interpreter.name} -- confirmed` : `${interpreter.name} -- found, confirming next`;
+}
+
+function describeClinic(name, zipcode, address) {
+  return address ? `${name} -- ${address}` : `${name} (ZIP ${zipcode})`;
+}
+
+// Shows/hides a "More details" <details> box based on whether it actually
+// has anything in it -- an empty disclosure that expands to nothing is worse
+// than no disclosure at all. `idPrefix` is "confirm" or "done": both screens
+// name their requirements/notes elements <prefix>Requirements(/List) and
+// <prefix>Notes(/List), so this reads them by that convention rather than
+// taking four extra element arguments.
+function setMoreDetails(idPrefix, rows, requirements, notes) {
+  const detailsEl = document.getElementById(`${idPrefix}More`);
+  fillRows(document.getElementById(`${idPrefix}MoreDetails`), rows);
+  fillList(
+    document.getElementById(`${idPrefix}Requirements`),
+    document.getElementById(`${idPrefix}RequirementsList`),
+    requirements || [],
+  );
+  fillList(
+    document.getElementById(`${idPrefix}Notes`),
+    document.getElementById(`${idPrefix}NotesList`),
+    notes || [],
+  );
+  detailsEl.hidden = rows.length === 0 && !(requirements || []).length && !(notes || []).length;
+}
+
+function startTracking(runId, plan, progressTitle, progressText, summary) {
   stopTracking();
   Object.assign(tracking, { id: runId, failures: 0, screen: null, answered: false, declinedByUser: false });
   try { localStorage.setItem(ACTIVE_RUN_KEY, runId); } catch (e) { /* private mode: tracking just won't survive a refresh */ }
+  document.getElementById("progressSummaryText").textContent = summary || "";
   document.getElementById("progressPlanText").textContent = plan;
+  document.getElementById("progressMore").hidden = !plan;
   showProgress(
     progressTitle || "Finding your appointment",
     progressText || "Calling clinics and interpreters. This can take a few minutes. Keep this page open -- we'll ask you before anything is booked.",
@@ -777,18 +838,24 @@ function setConfirmButtons(enabled) {
 }
 
 function showConfirm(proposal) {
-  const distance = proposal.clinic_distance_miles != null ? `, ${proposal.clinic_distance_miles} mi away` : "";
   const rows = [
-    ["Clinic", `${proposal.clinic_name} (${proposal.clinic_zipcode}${distance})`],
-    ["When", formatWhen(proposal.date, proposal.time)],
-    ["Interpreter", describeInterpreter(proposal.interpreter)],
+    ["Date", formatDate(proposal.date)],
+    ["Time", formatTime(proposal.time)],
+    ["Clinic", describeClinic(proposal.clinic_name, proposal.clinic_zipcode, proposal.clinic_address)],
+    ["Interpreter", describeInterpreterStatus(proposal.interpreter)],
   ];
-  if (proposal.alternates && proposal.alternates.length) {
-    rows.push(["If they decline", proposal.alternates.map(describeInterpreter).join("; ")]);
+
+  const moreRows = [];
+  if (proposal.interpreter && proposal.interpreter.tier === "freelance") {
+    moreRows.push(["Interpreter rate", describeInterpreter(proposal.interpreter)]);
   }
+  if (proposal.clinic_distance_miles != null) moreRows.push(["Distance", `${proposal.clinic_distance_miles} mi away`]);
+  if (proposal.alternates && proposal.alternates.length) {
+    moreRows.push(["If they decline", proposal.alternates.map(describeInterpreter).join("; ")]);
+  }
+
   fillRows(document.getElementById("confirmDetails"), rows);
-  fillList(document.getElementById("confirmRequirements"), document.getElementById("confirmRequirementsList"), proposal.requirements || []);
-  fillList(document.getElementById("confirmNotes"), document.getElementById("confirmNotesList"), proposal.notes || []);
+  setMoreDetails("confirm", moreRows, proposal.requirements, proposal.notes);
   hideBanner("confirmError");
   setConfirmButtons(true);
   document.title = `Action needed - ${APP_TITLE}`;
@@ -829,14 +896,25 @@ function showOutcome(booking) {
   let sub = "We'll text you once it's confirmed.";
   let kind = "ok";
   let rows = [];
+  let moreRows = [];
 
   if (booking.status === "succeeded") {
+    const contact = (result && result.clinic_contact) || {};
+    const slot = (result && result.appointment_slot) || {};
     title = "Appointment booked";
-    sub = proposal ? `${proposal.clinic_name}, ${formatWhen(proposal.date, proposal.time)}` : "Your appointment is booked.";
+    sub = `${contact.name || "Your clinic"}, ${formatWhen(slot.date, slot.time)}`;
+    rows = [
+      ["Date", formatDate(slot.date)],
+      ["Time", formatTime(slot.time)],
+      ["Clinic", describeClinic(contact.name, contact.zipcode, contact.address)],
+      ["Interpreter", describeInterpreterStatus(result && result.interpreter)],
+    ];
     const appointment = (result && result.appointment) || {};
-    if (appointment.booking_reference) rows.push(["Booking reference", appointment.booking_reference]);
-    if (appointment.confirmed_by) rows.push(["Confirmed by", appointment.confirmed_by]);
-    if (result && result.interpreter) rows.push(["Interpreter", describeInterpreter(result.interpreter)]);
+    if (appointment.booking_reference) moreRows.push(["Booking reference", appointment.booking_reference]);
+    if (appointment.confirmed_by) moreRows.push(["Confirmed by", appointment.confirmed_by]);
+    if (result && result.interpreter && result.interpreter.tier === "freelance") {
+      moreRows.push(["Interpreter rate", describeInterpreter(result.interpreter)]);
+    }
   } else if (booking.status === "declined") {
     title = "Nothing was booked";
     sub = tracking.declinedByUser
@@ -866,8 +944,7 @@ function showOutcome(booking) {
   document.getElementById("doneSub").textContent = sub;
   document.getElementById("doneIcon").dataset.kind = kind;
   fillRows(document.getElementById("doneDetails"), rows);
-  fillList(document.getElementById("doneRequirements"), document.getElementById("doneRequirementsList"), (result && result.requirements) || []);
-  fillList(document.getElementById("doneNotes"), document.getElementById("doneNotesList"), (result && result.notes) || []);
+  setMoreDetails("done", moreRows, (result && result.requirements) || [], (result && result.notes) || []);
   hideBanner("cancelError");
   const btnCancel = document.getElementById("btnCancelAppointment");
   const canCancel = booking.status === "succeeded" || booking.status === "cancel_failed";
@@ -944,6 +1021,100 @@ function wireDone() {
   document.getElementById("btnCancelAppointment").addEventListener("click", onCancelAppointment);
 }
 
+// ----------------------------------------------------------- history --
+//
+// Every booking this browser has ever submitted, most recent first -- how a
+// booking from days ago gets found and cancelled again, since by then
+// state.tracking's own localStorage pointer (see ACTIVE_RUN_KEY above) has
+// long since moved on to whatever was booked most recently, or been cleared
+// entirely. This list is read once when the screen opens; it does not poll.
+
+function statusLabel(status) {
+  return ({
+    running: "In progress", awaiting_confirmation: "Waiting on your answer",
+    succeeded: "Booked", declined: "Not booked", failed: "Couldn't finish",
+    cancelling: "Cancelling…", cancelled: "Cancelled", cancel_failed: "Couldn't cancel",
+  })[status] || status;
+}
+
+function describeBookingWhen(booking) {
+  const slot = booking.proposal || (booking.result && booking.result.appointment_slot);
+  return slot ? formatWhen(slot.date, slot.time) : null;
+}
+
+function describeBookingWhere(booking) {
+  if (booking.proposal) return booking.proposal.clinic_name;
+  const contact = booking.result && booking.result.clinic_contact;
+  return contact ? contact.name : "Appointment request";
+}
+
+async function openHistory() {
+  hideBanner("historyError");
+  document.getElementById("historyList").innerHTML = "";
+  document.getElementById("historyEmpty").hidden = true;
+  showScreen("history");
+  try {
+    const { bookings } = await apiGet(`/bookings?user_id=${encodeURIComponent(state.userId)}`);
+    renderHistory(bookings);
+  } catch (e) {
+    showBanner("historyError", e.message || "Couldn't load your bookings -- please try again.");
+  }
+}
+
+function renderHistory(bookings) {
+  const container = document.getElementById("historyList");
+  document.getElementById("historyEmpty").hidden = bookings.length > 0;
+  container.replaceChildren(
+    ...bookings.map((booking) => {
+      const card = el("div", "family-card");
+      const head = el("div", "family-card-head");
+      head.append(el("span", "", describeBookingWhere(booking)), el("span", "", statusLabel(booking.status)));
+      card.append(head);
+
+      const when = describeBookingWhen(booking);
+      if (when) card.append(el("div", "hint", when));
+      if (booking.result && booking.result.interpreter) {
+        card.append(el("div", "hint", `Interpreter: ${describeInterpreter(booking.result.interpreter)}`));
+      }
+      if (booking.status === "failed" && booking.error) card.append(el("div", "hint", booking.error));
+      if (booking.status === "declined" && booking.reason) card.append(el("div", "hint", booking.reason));
+      if (booking.status === "cancel_failed" && booking.error) card.append(el("div", "hint", booking.error));
+
+      if (booking.status === "succeeded" || booking.status === "cancel_failed") {
+        const btn = el("button", "btn btn-danger", booking.status === "cancel_failed" ? "Try cancelling again" : "Cancel");
+        btn.style.marginTop = "8px";
+        btn.addEventListener("click", () => onCancelFromHistory(booking.run_id, btn));
+        card.append(btn);
+      }
+      return card;
+    }),
+  );
+}
+
+async function onCancelFromHistory(runId, button) {
+  const confirmed = window.confirm(
+    "Cancel this appointment? We'll call the clinic to cancel, and call your interpreter (only if one was found and confirmed) to let them know it's off.",
+  );
+  if (!confirmed) return;
+
+  hideBanner("historyError");
+  button.disabled = true;
+  try {
+    await apiPostJson(`/bookings/${encodeURIComponent(runId)}/cancel`, { user_id: state.userId });
+  } catch (e) {
+    button.disabled = false;
+    showBanner("historyError", e.message || "Couldn't cancel -- please try again.");
+    return;
+  }
+  // Same progress/outcome flow the "done" screen's cancel uses -- leaves the
+  // history list and tracks this one run until the cancellation resolves.
+  startTracking(runId, "", CANCELLING_TITLE, CANCELLING_TEXT);
+}
+
+function wireHistory() {
+  document.getElementById("btnHistoryBack").addEventListener("click", () => showScreen("inputMethod"));
+}
+
 // --------------------------------------------------------------- wire-up --
 
 function wireUpAll() {
@@ -956,6 +1127,7 @@ function wireUpAll() {
   wireBookingConfirm();
   wireConfirm();
   wireDone();
+  wireHistory();
 }
 
 init();

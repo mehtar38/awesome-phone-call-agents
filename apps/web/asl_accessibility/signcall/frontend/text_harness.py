@@ -47,7 +47,7 @@ os.environ["CALLE_MOCK_MODE"] = "1"
 
 from ..calle import run as calle_run  # noqa: E402
 from ..calle.run import CallPurpose, CallResult, register_mock  # noqa: E402
-from ..workflow import clinic_lookup, interpreter_matching  # noqa: E402
+from ..workflow import clinic_lookup, interpreter_lookup, interpreter_matching  # noqa: E402
 from ..workflow.appointment import run_interpreter_mesh as _run_interpreter_mesh  # noqa: E402
 from ..workflow.confirmation import BookingDeclined, BookingProposal  # noqa: E402
 from ..workflow.types import AppointmentType, ClinicCandidate, InterpreterCandidate  # noqa: E402
@@ -150,6 +150,21 @@ def _slot(day_offset: int, time: str) -> dict:
         "date": when.strftime("%Y-%m-%d"),
         "time": time,
     }
+
+
+_WEEKDAY_CYCLE = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+
+def _slot_with_wrong_weekday(day_offset: int, time: str) -> dict:
+    """Same as _slot(), but `day` is deliberately wrong for `date` -- the next
+    name in the weekday cycle, so it can never accidentally agree. A past
+    version of this test hardcoded "sunday" here, which is only a mismatch
+    on days when day_offset days from now ISN'T actually a Sunday -- a real,
+    found bug (it fails every time that coincidence lines up, e.g. when
+    today + 3 days really is a Sunday)."""
+    slot = _slot(day_offset, time)
+    wrong_index = (_WEEKDAY_CYCLE.index(slot["day"]) + 1) % 7
+    return {**slot, "day": _WEEKDAY_CYCLE[wrong_index]}
 
 
 def _input_json(**overrides) -> dict:
@@ -295,7 +310,7 @@ def freelancer(
         register_mock(phone, resolver)
     return InterpreterCandidate(
         name=name, phone=phone, zipcode=zipcode, city="Las Vegas",
-        age=40, expertise=["medical"], distance_miles=distance,
+        age=40, expertise=["medical"], distance_miles=distance, source="injected",
     )
 
 
@@ -1021,7 +1036,7 @@ def scenario_input_validation() -> None:
     _reset()
     cases = [
         ("weekday/date mismatch",
-         _input_json(availability=[{**_slot(3, "2PM"), "day": "sunday"}]),
+         _input_json(availability=[_slot_with_wrong_weekday(3, "2PM")]),
          "is a"),
         ("availability date in the past",
          _input_json(availability=[_slot(-2, "2PM")]),
@@ -1034,8 +1049,8 @@ def scenario_input_validation() -> None:
         ("malformed time",
          _input_json(availability=[{**_slot(3, "2PM"), "time": "25PM"}]),
          "schema validation"),
-        ("ZIP outside this build's Nevada data",
-         _input_json(zipcode="60601"),
+        ("ZIP outside this build's covered states",
+         _input_json(zipcode="10001"),  # New York -- neither NV nor IL
          "outside this build's coverage"),
         ("unknown appointment type",
          _input_json(appointment_type="podiatry"),
@@ -1157,44 +1172,41 @@ def scenario_clinic_lookup() -> None:
         "an out-of-table ZIP must yield None, not a guess"
     )
 
+    # No synthetic fallback: a missing token (same as any other live-search
+    # failure) comes back as an empty list, not fabricated clinics -- an
+    # earlier version degraded to a committed synthetic dataset here, removed
+    # because a fake clinic that LOOKS like a real, callable result is worse
+    # than an honest failure (appointment.py raises a clear error on an empty
+    # list).
     dump = Path(tempfile.mkdtemp()) / "clinics_last_search.json"
     saved = os.environ.pop("APIFY_API_TOKEN", None)
     try:
-        fallback = clinic_lookup.find_clinics(USER_ZIP, AppointmentType.DENTAL, dump_path=dump)
-        assert clinic_lookup.find_clinics(
-            USER_ZIP, AppointmentType.DENTAL, allow_fallback=False, dump_path=None
-        ) == [], "allow_fallback=False must not quietly hand back synthetic clinics"
+        empty = clinic_lookup.find_clinics(USER_ZIP, AppointmentType.DENTAL, dump_path=dump)
     finally:
         if saved is not None:
             os.environ["APIFY_API_TOKEN"] = saved
-    assert len(fallback) == 10, f"fallback should fill the 10-clinic cap, got {len(fallback)}"
-    assert all(c.source == "fallback_snapshot" for c in fallback), (
-        "BUG: fallback data must be tagged so nothing mistakes it for live results"
-    )
-    assert all(c.clinic_type for c in fallback), "fallback clinics carry a type too"
-    distances = [c.distance_miles for c in fallback]
-    assert distances == sorted(d for d in distances), "fallback must still be nearest-first"
+    assert empty == [], "BUG: a missing token must not quietly hand back synthetic clinics"
 
     dumped = json.loads(dump.read_text())
-    assert dumped["source"] == "fallback_snapshot" and dumped["searched_zipcode"] == USER_ZIP
-    assert len(dumped["clinics"]) == 10
-    assert all(clinic_lookup.validate_record(r) for r in dumped["clinics"]), (
-        "the dump file must hold records that satisfy the schema"
-    )
+    assert dumped["source"] == "apify_google_maps" and dumped["searched_zipcode"] == USER_ZIP
+    assert dumped["clinics"] == [], "the dump file must honestly record that nothing was found"
     assert not CALLS, "a lookup places no calls"
     print("\nOK: Maps field mapping, every drop rule (closed / no phone / no ZIP / "
           "non-US / off-category / duplicate), schema validation, the dump file, "
-          "and a tagged synthetic fallback.")
+          "and an honest empty result on a missing token -- no synthetic fallback.")
 
 
 def scenario_roster_load() -> None:
-    """The seeded interpreter roster: 30 synthetic records, half in Las Vegas,
-    loaded and bounded by travel distance from the MATCHED clinic's ZIP."""
+    """The seeded interpreter roster: a TEST FIXTURE only (see
+    interpreter_matching.load_candidates_within_radius()'s docstring --
+    nothing in a live run reads this file anymore), 29 synthetic records,
+    14 in Las Vegas, loaded and bounded by travel distance from the MATCHED
+    clinic's ZIP."""
     _reset()
     roster = interpreter_matching._roster()
-    assert len(roster) == 30, f"expected 30 interpreters, got {len(roster)}"
+    assert len(roster) == 29, f"expected 29 interpreters, got {len(roster)}"
     vegas = [r for r in roster if r["city"] == "Las Vegas"]
-    assert len(vegas) == 15, f"expected half in Las Vegas, got {len(vegas)}"
+    assert len(vegas) == 14, f"expected 14 in Las Vegas, got {len(vegas)}"
     assert all(set(r) >= {"name", "age", "phone_number", "zipcode", "expertise"} for r in roster)
     # The invariant that matters is "no roster number can ring a stranger".
     # Two ways to satisfy it: a number in the 555-0100..0199 block reserved for
@@ -1236,6 +1248,82 @@ def scenario_roster_load() -> None:
     assert not CALLS, "loading the roster places no calls"
     print("\nOK: 30 synthetic records, 15 in Las Vegas, fictional-block numbers, "
           "radius-bounded nearest-first loading, and no cross-run contamination.")
+
+
+def scenario_il_interpreter_lookup() -> None:
+    """The live Illinois interpreter source's pure parsing and county/region
+    tiering, against canned directory rows -- no network. The live fetch
+    itself (interpreter_lookup._fetch_directory) is monkeypatched out, same
+    spirit as clinic_lookup's canned-items test: the HTTP call is somebody
+    else's problem (httpx is pinned and used identically to the Apify path),
+    what this build owns is correctly reading what comes back."""
+    _reset()
+
+    assert interpreter_lookup.is_illinois_zip("60601"), "Chicago is in the IL centroid table"
+    assert not interpreter_lookup.is_illinois_zip(USER_ZIP), "a Nevada ZIP must not read as Illinois"
+    assert interpreter_lookup._county_for_zip("60601") == "Cook"
+    assert interpreter_lookup._county_for_zip("99999") is None, "an unknown ZIP has no county"
+
+    # Row shape: [name, "City, State", county, region, level, status,
+    # disciplined?, email, primary phone, alt phone, deaf interpreter?]
+    def _row(name, county, region, status, phone_digits=None):
+        phone_cell = f"<a href='tel:+1{phone_digits}'>{phone_digits}</a>" if phone_digits else ""
+        return [name, "Somewhere, Illinois", county, region, "General-Advanced", status,
+                "No", "<a href='mailto:x@example.com'>x@example.com</a>", phone_cell, "", "No"]
+
+    # IDHHC's own rows pair Cook county with a region ALSO called "Cook" (see
+    # the live sample captured during research) -- kept the same way here so
+    # a Cook-county clinic's region comes from the rows themselves, not a
+    # hardcoded assumption.
+    canned_rows = [
+        _row("Cook Match", "Cook", "Cook", "Active", "7735550101"),        # tier 1: same county
+        _row("Region Match", "DuPage", "Cook", "Active", "6305550102"),    # tier 2: same region, other county
+        _row("Wrong Region", "Madison", "West Central", "Active", "6185550103"),  # excluded: different region
+        _row("No Phone", "Cook", "Cook", "Active", None),                 # excluded: no phone at all
+        _row("Expired License", "Cook", "Cook", "Expired", "7735550104"), # excluded: not Active
+    ]
+
+    assert interpreter_lookup._extract_phone("<a href='tel:+17735550101'>7735550101</a>") == "+17735550101"
+    assert interpreter_lookup._extract_phone("") is None, "a blank cell has no phone to extract"
+
+    real_fetch = interpreter_lookup._fetch_directory
+    interpreter_lookup._fetch_directory = lambda: canned_rows
+    try:
+        found = interpreter_lookup.find_interpreters_il("60601")  # Chicago, Cook county
+    finally:
+        interpreter_lookup._fetch_directory = real_fetch
+
+    names = [c.name for c in found]
+    assert names == ["Cook Match", "Region Match"], (
+        f"BUG: wrong set/order survived county/region tiering and filtering -- got {names}"
+    )
+    assert found[0].phone == "+17735550101" and found[0].source == "il_directory"
+    assert all(c.rate_per_hour is None for c in found), "rates are asked on the call, never assumed"
+    assert found[0].expertise == ["General-Advanced license"], (
+        "license level is surfaced as expertise, since nothing else is published"
+    )
+
+    os.environ["SIGNCALL_DISABLE_IL_LOOKUP"] = "1"
+
+    def _must_not_be_called():
+        raise AssertionError("BUG: the live fetch ran despite SIGNCALL_DISABLE_IL_LOOKUP=1")
+
+    interpreter_lookup._fetch_directory = _must_not_be_called
+    try:
+        assert interpreter_lookup.find_interpreters_il("60601") == [], (
+            "SIGNCALL_DISABLE_IL_LOOKUP=1 must short-circuit before any request"
+        )
+    finally:
+        interpreter_lookup._fetch_directory = real_fetch
+        os.environ.pop("SIGNCALL_DISABLE_IL_LOOKUP", None)
+
+    assert interpreter_lookup.find_interpreters_il(USER_ZIP) == [], (
+        "a ZIP with no Illinois county on file must return empty, not raise or guess"
+    )
+    assert not CALLS, "parsing and matching interpreters places no calls"
+    print("\nOK: Illinois ZIP/county lookup, phone extraction from the directory's own "
+          "tel: links, Active+has-a-phone filtering, county-then-region tiering read off "
+          "the rows themselves, and SIGNCALL_DISABLE_IL_LOOKUP short-circuiting before any request.")
 
 
 def scenario_call_routing() -> None:
@@ -1308,17 +1396,38 @@ def scenario_api_endpoint() -> None:
     """The HTTP endpoint the frontend POSTs to, exercised in-process with
     FastAPI's TestClient -- no server, no network, no calls.
 
-    APIFY_API_TOKEN is popped for the duration so find_clinics() takes the
-    committed synthetic fallback instead of firing a live Apify run, and the
-    per-run demo mock answers those numbers. The API is imported HERE rather
-    than at module scope: importing it sets no default mock (registration is
-    per-run), but keeping the import local also keeps the other scenarios'
-    deliberately-unmocked tripwires obviously untouched.
+    There's no synthetic fallback anymore for either leg (see clinic_lookup.py
+    and appointment.py::_resolve_freelance_pool() -- an honest empty result
+    beats a fabricated one), so this scenario runs its happy path against an
+    ILLINOIS ZIP and mocks the two live TRANSPORTS directly instead:
+    clinic_lookup.fetch_places() (so find_clinics() still runs its real
+    filtering/sorting code against controlled data, not a live Apify call)
+    and interpreter_lookup._fetch_directory() (same reasoning, for
+    find_interpreters_il()). That's a closer simulation of a genuinely
+    successful live run than the old Nevada-fallback path ever was. The API
+    is imported HERE rather than at module scope: importing it sets no
+    default mock (registration is per-run), but keeping the import local also
+    keeps the other scenarios' deliberately-unmocked tripwires obviously
+    untouched.
     """
     _reset()
     os.environ["CALLE_MOCK_MODE"] = "1"
     os.environ["SIGNCALL_API_DEMO_MOCKS"] = "1"
-    saved_token = os.environ.pop("APIFY_API_TOKEN", None)
+    il_zip = "60616"  # Chicago, Cook county -- see module docstring above
+
+    saved_token = os.environ.get("APIFY_API_TOKEN")
+    os.environ["APIFY_API_TOKEN"] = "test-token"  # present, but fetch_places() below never reads it
+    real_fetch_places = clinic_lookup.fetch_places
+    clinic_lookup.fetch_places = lambda zipcode, appointment_type, token: [{
+        "title": "Bridgeport Dental Care", "categoryName": "Dentist",
+        "phoneUnformatted": "+13125550199", "postalCode": il_zip,
+    }]
+    real_fetch_directory = interpreter_lookup._fetch_directory
+    interpreter_lookup._fetch_directory = lambda: [[
+        "Demo Interpreter", "Chicago, Illinois", "Cook", "Cook",
+        "General-Advanced", "Active", "No", "",
+        "<a href='tel:+17735550101'>7735550101</a>", "", "No",
+    ]]
     try:
         from fastapi.testclient import TestClient  # noqa: PLC0415
 
@@ -1333,7 +1442,7 @@ def scenario_api_endpoint() -> None:
         assert "CALLE_API_KEY" not in str(health), "credentials must never be echoed"
 
         # 1. A malformed profile is rejected before anything is accepted.
-        bad = client.post("/runs", json=_input_json(zipcode="60601"))
+        bad = client.post("/runs", json=_input_json(zipcode="10001"))  # New York -- neither NV nor IL
         assert bad.status_code == 400, f"expected 400, got {bad.status_code}"
         assert "outside this build's coverage" in bad.json()["detail"], (
             "the 400 must carry the validator's own message, not a generic one"
@@ -1366,7 +1475,7 @@ def scenario_api_endpoint() -> None:
         demo_mocks.build_cancel_resolver = spying_cancel_build
 
         def start_run() -> dict:
-            response = client.post("/runs", json=_input_json())
+            response = client.post("/runs", json=_input_json(zipcode=il_zip))
             assert response.status_code == 202, (
                 f"expected 202, got {response.status_code}: {response.text}"
             )
@@ -1467,6 +1576,41 @@ def scenario_api_endpoint() -> None:
             "cancelling an already-cancelled run must be refused too"
         )
 
+        # 4c. Cancelling a run this SERVER PROCESS has forgotten -- the real
+        #     scenario a restart between booking and cancelling produces.
+        #     This is the one place this scenario reaches into server._runs
+        #     directly: there's no HTTP call that simulates "the process
+        #     restarted," so the forgetting itself has to be done by hand.
+        _reset()
+        events.clear()
+        run_id = start_run()["run_id"]
+        wait_for(run_id, "awaiting_confirmation")
+        confirm(run_id, True)
+        forgotten = wait_for(run_id, "succeeded", "failed", "declined")
+        assert forgotten["status"] == "succeeded", forgotten
+        saved_result = forgotten["result"]
+
+        with server._runs_guard:
+            del server._runs[run_id]
+        assert client.get(f"/runs/{run_id}").status_code == 404, (
+            "sanity check: the run must actually be gone from memory now"
+        )
+        assert client.post(f"/runs/{run_id}/cancel").status_code == 404, (
+            "with no body and no memory of the run, there's nothing to adopt it from"
+        )
+
+        calls_before_forgotten_cancel = len(CALLS)
+        adopted = client.post(
+            f"/runs/{run_id}/cancel", json={"result": saved_result, "patient_name": "Dana Reyes"},
+        )
+        assert adopted.status_code == 202, adopted.text
+        resolved = wait_for(run_id, "cancelled", "cancel_failed")
+        assert resolved["status"] == "cancelled", (
+            f"a run adopted from a supplied body must still cancel cleanly: {resolved}"
+        )
+        forgotten_purposes = [p for _, _, p in CALLS[calls_before_forgotten_cancel:]]
+        assert CallPurpose.CLINIC_CANCEL in forgotten_purposes
+
         # 5. Saying no ends the run with nothing booked, and frees the lock.
         _reset()
         events.clear()
@@ -1495,8 +1639,12 @@ def scenario_api_endpoint() -> None:
         notify.send_event = real_send
         demo_mocks.build_resolver, demo_mocks.build_cancel_resolver = real_build, real_cancel_build
         server.CONFIRM_TIMEOUT_SECONDS = real_timeout
+        clinic_lookup.fetch_places = real_fetch_places
+        interpreter_lookup._fetch_directory = real_fetch_directory
         if saved_token is not None:
             os.environ["APIFY_API_TOKEN"] = saved_token
+        else:
+            os.environ.pop("APIFY_API_TOKEN", None)
         os.environ.pop("SIGNCALL_API_DEMO_MOCKS", None)
 
     print("\nOK: bad input rejected 400 with no run and no calls; a valid one "
@@ -1505,8 +1653,11 @@ def scenario_api_endpoint() -> None:
           "the clinic then confirmed the interpreter; a second answer was "
           "refused 409; cancelling the succeeded booking cancelled the clinic "
           "and released the interpreter, refused a second cancel, and leaked "
-          "no internal fields; saying no ended it as declined with nothing "
-          "booked; no answer timed out to declined; the lock was released each time.")
+          "no internal fields; a run this process had forgotten (the real "
+          "restart-then-cancel scenario) still cancelled cleanly once its own "
+          "stored result was supplied; saying no ended it as declined with "
+          "nothing booked; no answer timed out to declined; the lock was "
+          "released each time.")
 
 
 SCENARIOS = {
@@ -1526,6 +1677,7 @@ SCENARIOS = {
     "input_validation": scenario_input_validation,
     "clinic_lookup": scenario_clinic_lookup,
     "roster_load": scenario_roster_load,
+    "il_interpreter_lookup": scenario_il_interpreter_lookup,
     "call_routing": scenario_call_routing,
     "api_endpoint": scenario_api_endpoint,
 }

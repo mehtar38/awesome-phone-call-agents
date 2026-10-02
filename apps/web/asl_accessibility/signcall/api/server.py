@@ -5,12 +5,26 @@ The endpoint the frontend POSTs to.
     GET  /runs/{id}          -> {status, proposal, result | error | reason, plan,
                                  started_at, finished_at}
     POST /runs/{id}/confirm  -> the user's answer: {"approved": true | false}
-    POST /runs/{id}/cancel   -> 202, cancels an already-succeeded booking
+    POST /runs/{id}/cancel   -> 202, cancels an already-succeeded booking.
+                                Body optional: {"result": {...}, "patient_name": "..."}
+                                supplies the booking's own details when this
+                                process no longer remembers the run (see below).
     GET  /health             -> {mock_mode, real_calls_allowed, credentials present}
 
 A run's status is running -> awaiting_confirmation -> running -> one of
 succeeded | declined | failed. A succeeded run can move on once more, only on
 the user's own request: succeeded -> cancelling -> cancelled | cancel_failed.
+
+This server keeps NO durable storage of its own -- `_runs` below is a plain
+in-memory dict, gone the moment the process restarts. That's fine for a run
+still in progress (the frontend polls the SAME process that's running it),
+but a cancel request can arrive long after -- the frontend's own database
+outlives this process by design. So POST .../cancel's body is optional
+exactly so a "forgotten" run (this process never ran it, or was restarted
+since) can still be cancelled: the caller supplies the booking's own
+`result` and `patient_name` (which the frontend already has stored), and
+this server "adopts" the run from that rather than requiring its own memory
+to still hold it. See cancel_run() below.
 
 Shape of the contract, and why:
 
@@ -29,8 +43,8 @@ Shape of the contract, and why:
     No answer within SIGNCALL_CONFIRM_TIMEOUT_SECONDS (default 900) counts as
     "no", and the run ends as declined.
 
-Run it (from apps/, never from apps/signcall/ -- see README's naming-collision
-note):
+Run it (from apps/web/asl_accessibility/, never from .../signcall/ itself --
+see README's naming-collision note):
 
     CALLE_MOCK_MODE=1 SIGNCALL_API_DEMO_MOCKS=1 \\
         uvicorn signcall.api.server:app --host 127.0.0.1 --port 8000
@@ -49,7 +63,7 @@ import threading
 import uuid
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictBool
@@ -109,6 +123,17 @@ _decisions: dict[str, _Decision] = {}
 
 class ConfirmRequest(BaseModel):
     approved: StrictBool
+
+
+class CancelRequest(BaseModel):
+    """Optional -- only needed when this process doesn't already have the
+    run in memory. `result` is exactly the dict a succeeded run's `result`
+    field already is (dataclasses.asdict(AppointmentResult)); the frontend
+    already has it stored verbatim, so this is a pass-through, not a new
+    shape to build."""
+
+    result: dict | None = None
+    patient_name: str | None = None
 
 
 def _assert_mode_is_deliberate() -> None:
@@ -359,25 +384,52 @@ def _execute_cancel(run_id: str) -> None:
 
 
 @app.post("/runs/{run_id}/cancel", status_code=202)
-def cancel_run(run_id: str) -> JSONResponse:
+def cancel_run(run_id: str, body: CancelRequest | None = Body(default=None)) -> JSONResponse:
     """Cancels an already-succeeded booking: calls the clinic to cancel,
     then releases whoever was lined up to interpret it. Valid from
     `succeeded`, and retriable from `cancel_failed` (nothing about a failed
     cancel attempt un-books the appointment, so trying again is exactly
     what should happen) -- refused from any other status, and refused while
     a cancellation is already in flight, the same way a second confirm
-    answer is."""
+    answer is.
+
+    Stateless-friendly (see the module docstring): if this process has no
+    memory of the run at all, `body.result` + `body.patient_name` let it
+    "adopt" the run as if it had just succeeded, rather than 404ing outright.
+    If it DOES remember the run, a supplied body is still preferred over
+    this process's own copy -- the frontend's is the durable one; this
+    process's is only ever a cache of what it saw at the time."""
     global _active_run_id
 
     with _runs_guard:
         run = _runs.get(run_id)
         if run is None:
-            raise HTTPException(status_code=404, detail=f"No run with id {run_id}.")
-        if run["status"] not in ("succeeded", "cancel_failed"):
+            if body is None or body.result is None or not body.patient_name:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"No run with id {run_id}, and no booking details were "
+                        f"supplied to cancel it with. This server keeps no "
+                        f"memory of a run across a restart -- pass `result` and "
+                        f"`patient_name` from your own stored record."
+                    ),
+                )
+            run = _runs[run_id] = {
+                "run_id": run_id, "status": "succeeded", "plan": None,
+                "mock_mode": MOCK_MODE, "started_at": None, "finished_at": None,
+                "proposal": None, "result": body.result, "error": None,
+                "error_type": None, "reason": None, "cancellation": None,
+                "_patient_name": body.patient_name,
+            }
+        elif run["status"] not in ("succeeded", "cancel_failed"):
             raise HTTPException(
                 status_code=409,
                 detail=f"Run {run_id} has nothing to cancel right now (status: {run['status']}).",
             )
+        elif body is not None and body.result is not None:
+            run["result"] = body.result
+            if body.patient_name:
+                run["_patient_name"] = body.patient_name
 
     if not _run_lock.acquire(blocking=False):
         raise HTTPException(

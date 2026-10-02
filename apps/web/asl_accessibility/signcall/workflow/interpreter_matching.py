@@ -102,14 +102,24 @@ def load_candidates_within_radius(
     search list practical; rate, not distance, decides who gets booked
     (see rank_by_rate below).
 
-    Backed by data/interpreters_nv.json: 30 SYNTHETIC interpreters modelled on
-    the structure of public ASL interpreter directories, half of them in Las
-    Vegas and half spread across the rest of Nevada. Real directory data
-    (RID's registry, state referral lists) can't be used to place live demo
-    calls, so the data is invented and every number sits in the reserved
-    555-01xx fictional block -- the shape and distribution are real, the
-    people are not. Rates and minimum hours are deliberately absent from the
-    roster: they're asked on the call, never assumed.
+    NOT wired into any live run. `appointment.py::_resolve_freelance_pool()`
+    only ever calls workflow/interpreter_lookup.py's live Illinois registry
+    lookup for an Illinois clinic, and returns an empty pool for everywhere
+    else covered -- an honest "no interpreter source for this area yet"
+    rather than a fabricated match (see that function's docstring). This
+    function is kept as a TEST FIXTURE ONLY, exercising the batching/
+    radius/rate-ranking logic below against the seeded roster so that logic
+    stays covered even though nothing live reads from it. A real deployer
+    with their own consented interpreter data source for another state wires
+    it in at `_resolve_freelance_pool()`, the same way Illinois's is.
+
+    Backed by data/interpreters_nv.json: 29 SYNTHETIC interpreters modelled on
+    the structure of public ASL interpreter directories, 14 of them in Las
+    Vegas and 15 spread across the rest of Nevada -- invented data, kept
+    demo-safe with every number in the reserved 555-01xx fictional block or
+    one of the operator's own test lines (see roster_load's test for which).
+    Rates and minimum hours are deliberately absent from the roster: they're
+    asked on the call, never assumed.
 
     `clinic_zip` is the MATCHED clinic's ZIP, which only exists because the
     clinic is now discovered (Step 2) rather than supplied -- this function
@@ -129,6 +139,7 @@ def load_candidates_within_radius(
                 age=record.get("age"),
                 expertise=list(record.get("expertise", [])),
                 distance_miles=distance,
+                source="seeded_roster",
             )
         )
     candidates.sort(key=lambda c: distance_sort_key(c.distance_miles))

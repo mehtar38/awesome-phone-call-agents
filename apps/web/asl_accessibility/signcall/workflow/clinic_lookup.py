@@ -26,16 +26,20 @@ What is still true, and worth knowing:
     a synchronous call -- the workflow waits on it.
   - Distance is computed here from ZIP centroids, not from Maps' own
     ordering, so clinics sharing the user's ZIP all score 0.0 and a ZIP
-    outside the Nevada centroid table sorts last.
+    outside the covered-states centroid table (see user_input.COVERED_STATES)
+    sorts last.
   - `type` is the listing's own category. Only when Maps returns none does it
     fall back to the label that was searched for, which is the one case where
     it asserts nothing about the clinic.
-  - The emergency fallback (data/clinics_fallback.json) is SYNTHETIC, not a
-    cached snapshot of real businesses. A committed file of real clinic names
-    paired with fetched phone numbers risks publishing a real practice's
-    number under the wrong name; the fallback exists to keep a demo alive, so
-    it is invented data with reserved 555-01xx numbers, always tagged
-    source="fallback_snapshot".
+  - No synthetic fallback: a missing token, an Apify failure, or zero places
+    surviving the filters all come back as an empty list, not fabricated
+    clinics. An earlier version degraded to a committed synthetic dataset
+    (data/clinics_fallback.json) "to keep a demo alive" -- removed because a
+    fake clinic that LOOKS like a real, callable result is worse than an
+    honest failure: appointment.py already raises a clear "no clinic could be
+    found" error on an empty list, which is what a real search failure should
+    do instead of silently booking nothing against a clinic that doesn't
+    exist.
 """
 
 from __future__ import annotations
@@ -50,13 +54,12 @@ from datetime import datetime
 from pathlib import Path
 
 from .types import AppointmentType, ClinicCandidate, distance_sort_key
-from .user_input import zip_centroids
+from .user_input import zip_centroids, zip_state
 
 APIFY_BASE = "https://api.apify.com/v2"
 APIFY_ACTOR = "compass~crawler-google-places"  # tilde-encoded "compass/crawler-google-places"
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-FALLBACK_PATH = DATA_DIR / "clinics_fallback.json"
 DEFAULT_DUMP_PATH = DATA_DIR / "clinics_last_search.json"
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "clinic_record.schema.json"
 
@@ -103,7 +106,6 @@ _ZIP_RE = re.compile(r"(\d{5})")
 # returns "+12079460958", a live US number belonging to an unrelated party.
 _US_PHONE_RE = re.compile(r"^(?:\+?1)?([2-9][0-9]{2})([2-9][0-9]{2})([0-9]{4})$")
 
-_fallback_cache: dict | None = None
 _schema_cache: dict | None = None
 
 
@@ -255,7 +257,7 @@ def haversine_miles(a: "tuple[float, float]", b: "tuple[float, float]") -> float
 
 
 def zip_distance_miles(zip_a: str, zip_b: str) -> float | None:
-    """None when either ZIP is outside the (Nevada-only) centroid table --
+    """None when either ZIP is outside the covered-states centroid table --
     callers sort those last via types.distance_sort_key rather than guessing."""
     centroids = zip_centroids()
     first, second = centroids.get(zip_a), centroids.get(zip_b)
@@ -267,12 +269,20 @@ def zip_distance_miles(zip_a: str, zip_b: str) -> float | None:
 # --- Apify transport -----------------------------------------------------
 
 def _actor_input(zipcode: str, appointment_type: AppointmentType) -> dict:
+    # The actor geocodes locationQuery to a polygon before crawling and
+    # errors the run outright when it can't resolve one; a bare 5-digit ZIP
+    # is a known weak case, so the state is spelled out too -- resolved from
+    # the ZIP itself (see zip_state()), NOT hardcoded. A hardcoded "NV" here
+    # was a real, found bug: it silently broke every non-Nevada ZIP, which
+    # is a nonsense location Apify can't geocode, returns zero places for,
+    # and which find_clinics() then (correctly, given that empty result)
+    # fell back from to the NV-only synthetic dataset -- regardless of which
+    # state the user actually typed.
+    state = zip_state(zipcode)
+    location = f"{zipcode}, {state}, United States" if state else f"{zipcode}, United States"
     return {
         "searchStringsArray": [SEARCH_PHRASES[appointment_type]],
-        # The actor geocodes locationQuery to a polygon before crawling and
-        # errors the run outright when it can't resolve one; a bare 5-digit
-        # ZIP is a known weak case, so it's spelled out.
-        "locationQuery": f"{zipcode}, NV, United States",
+        "locationQuery": location,
         "maxCrawledPlacesPerSearch": MAX_PLACES_REQUESTED,
         "language": "en",
         "skipClosedPlaces": True,
@@ -316,27 +326,7 @@ def fetch_places(zipcode: str, appointment_type: AppointmentType, token: str) ->
         return items.json()  
 
 
-# --- fallback + dump -----------------------------------------------------
-
-def _fallback_records(appointment_type: AppointmentType) -> list[dict]:
-    global _fallback_cache
-    if _fallback_cache is None:
-        _fallback_cache = json.loads(FALLBACK_PATH.read_text(encoding="utf-8"))
-    records = []
-    for entry in _fallback_cache["clinics"].get(appointment_type.value, []):
-        record = {
-            "name": entry["name"],
-            "type": entry["type"],
-            "phone": entry["phone_number"],
-            "zipcode": entry["zipcode"],
-        }
-        # No invented street exists for a synthetic clinic -- city + ZIP is
-        # the honest ceiling of what this data can say about where it is.
-        if entry.get("city"):
-            record["address"] = f"{entry['city']}, NV {entry['zipcode']}"
-        records.append(record)
-    return records
-
+# --- dump -----------------------------------------------------------------
 
 def _dump(path, zipcode: str, appointment_type: AppointmentType, source: str, records: list[dict]) -> None:
     """Inspection side-file. Written atomically so a partial write can't leave
@@ -365,23 +355,19 @@ def find_clinics(
     zipcode: str,
     appointment_type: AppointmentType,
     limit: int = 10,
-    allow_fallback: bool = True,
     dump_path=DEFAULT_DUMP_PATH,
 ) -> list[ClinicCandidate]:
     """Up to `limit` clinics, nearest first. Returns whatever qualifies --
-    fewer than `limit` is an ordinary outcome.
+    fewer than `limit` is an ordinary outcome, and so is an empty list.
 
     Every failure mode (missing token, auth error, 402 usage limit, 429, a
     FAILED/ABORTED/TIMED-OUT run, the poll deadline, an unresolvable location,
-    or zero places surviving the filters) degrades to the committed synthetic
-    fallback, tagged source="fallback_snapshot" so nothing can mistake it for
-    live data. Nothing escapes this function: appointment.py calls it
-    unguarded, and a demo shouldn't die because an actor run failed.
-
-    `allow_fallback=False` turns that off -- use it when the point is to prove
-    the live path actually worked."""
+    or zero places surviving the filters) comes back as an empty list.
+    Nothing is fabricated to paper over it: appointment.py's caller raises a
+    clear "no clinic could be found" error on an empty list, which is the
+    honest outcome of a real search turning up nothing -- not a fake clinic
+    that looks like a real, callable result."""
     token = os.environ.get("APIFY_API_TOKEN")
-    source = "apify_google_maps"
     records: list[dict] = []
     if token:
         try:
@@ -389,13 +375,7 @@ def find_clinics(
         except Exception:
             records = []
 
-    if not records:
-        if not allow_fallback:
-            return []
-        source = "fallback_snapshot"
-        records = _fallback_records(appointment_type)
-
-    clinics = [record_to_candidate(record, source) for record in records]
+    clinics = [record_to_candidate(record, "apify_google_maps") for record in records]
     for clinic in clinics:
         clinic.distance_miles = zip_distance_miles(zipcode, clinic.zipcode)
     clinics.sort(key=lambda c: distance_sort_key(c.distance_miles))
@@ -405,5 +385,5 @@ def find_clinics(
     # the workflow went on to call -- not a longer list of everything the
     # search happened to turn up.
     if dump_path is not None:
-        _dump(dump_path, zipcode, appointment_type, source, [candidate_to_record(c) for c in clinics])
+        _dump(dump_path, zipcode, appointment_type, "apify_google_maps", [candidate_to_record(c) for c in clinics])
     return clinics

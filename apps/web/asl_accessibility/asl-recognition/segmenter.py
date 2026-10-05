@@ -1,43 +1,25 @@
 """
-Turns a CONTINUOUS stream of per-frame landmark feature vectors into discrete
-"here's one sign" segments, so a user can sign naturally -- at their own
-pace, one word after another -- without clicking a button per word.
+Splits a continuous stream of per-frame feature vectors into one segment per
+sign, so a user can sign word after word without pressing a button each time.
 
-Be clear about what this is and isn't: this is NOT continuous sign language
-recognition (that's a genuinely hard research problem -- coarticulated,
-fluid signing, needing continuous sentence-level training data, which this
-project's dataset doesn't have -- it's isolated word clips only). What this
-IS: continuous capture + automatic segmentation, using the same
-hand-presence signal MediaPipe already gives us, so the boundary between
-signs is detected instead of manually marked. Each detected segment is then
-classified independently by the existing isolated-word model -- same model,
-same features, just fed automatically instead of one clip at a time.
+This is segmentation, not continuous sign-language recognition. A segment is
+the run of frames from when a hand appears until no hand has been visible for
+ABSENT_FRAMES_FOR_BOUNDARY frames, and each segment is classified on its own
+by the isolated-word model. Hand presence is used rather than motion because
+the training clips are dictionary-style (hands enter, sign, leave), and because
+motion thresholds miss signs that are mostly a held handshape, such as
+fingerspelled letters.
 
-Why hand-presence rather than motion: the dataset this model was trained on
-is dictionary-style isolated clips -- hands enter frame, perform the sign,
-leave/drop out of frame or return to rest. Segmenting on "is a hand visible"
-mirrors that structure directly, and it doesn't fail on signs that are mostly
-a held handshape with little translation (many fingerspelled letters, for
-example) the way a pure motion-magnitude threshold would.
-
-TUNING WARNING: ABSENT_FRAMES_FOR_BOUNDARY below was NOT tuned against a real
-camera or a real signer -- this sandbox has neither. It's a reasonable
-starting point given a ~7-10fps capture rate (see static/index.html), but
-expect to adjust it once you're testing live:
-  - Words getting cut in half / one sign split into two -> raise it (the
-    signer is pausing mid-sign, e.g. between fingerspelled letters, longer
-    than the current threshold allows).
-  - Two distinct signs getting merged into one segment -> lower it.
-  - MIN_SEGMENT_FRAMES filters out brief false triggers (a hand flickering
-    into frame for an instant); MAX_SEGMENT_FRAMES is just a safety net so a
-    stuck-open hand can't buffer forever.
+The thresholds were chosen for a ~7-10 fps capture rate and have not been tuned
+across signers or cameras. Words split in two: raise ABSENT_FRAMES_FOR_BOUNDARY.
+Two signs merged into one: lower it.
 """
 import numpy as np
 
-ABSENT_FRAMES_FOR_BOUNDARY = 8   # consecutive no-hand frames => a sign just ended
-MIN_SEGMENT_FRAMES = 5           # shorter than this => discard as noise
-MAX_SEGMENT_FRAMES = 150         # safety cap regardless of boundary detection
-TAIL_TRIM_FRAMES = 2
+ABSENT_FRAMES_FOR_BOUNDARY = 8   # consecutive no-hand frames that end a sign
+MIN_SEGMENT_FRAMES = 5           # shorter segments are discarded as noise
+MAX_SEGMENT_FRAMES = 150         # cap so a stuck-open hand cannot buffer forever
+TAIL_TRIM_FRAMES = 2             # trailing frames dropped from each segment
 LEFT_PRESENT_IDX, RIGHT_PRESENT_IDX = 225, 226
 
 
@@ -46,10 +28,8 @@ def _hands_present(feat: np.ndarray) -> bool:
 
 
 class SignSegmenter:
-    """Stateful, one instance per active camera session (e.g. per WebSocket
-    connection). Feed it one feature vector per frame via add_frame(); it
-    returns a stacked (T, FEATURE_DIM) array the instant it decides a
-    complete sign just ended, or None on every other frame."""
+    """One instance per camera session. add_frame() returns a stacked
+    (T, FEATURE_DIM) array when a sign has just ended, otherwise None."""
 
     def __init__(self):
         self.buffer = []
@@ -62,13 +42,11 @@ class SignSegmenter:
             self.absent_count = 0
             self.buffer.append(feat)
         elif self.buffer:
-            # a sign is in progress and hands just disappeared/rested --
-            # keep buffering briefly in case this is a blip, not a real end
+            # hands gone mid-sign: keep buffering in case it is only a dropout
             self.absent_count += 1
             self.buffer.append(feat)
             if self.absent_count >= ABSENT_FRAMES_FOR_BOUNDARY:
                 return self._flush()
-        # else: idle, no hands, nothing buffered -- nothing to do
 
         if len(self.buffer) >= MAX_SEGMENT_FRAMES:
             return self._flush()
@@ -94,6 +72,5 @@ class SignSegmenter:
         return np.stack(segment)
 
     def is_active(self) -> bool:
-        """True while a sign is currently being buffered -- use this to
-        drive a live 'signing detected' indicator in the UI."""
+        """True while a sign is being buffered; drives the UI's signing indicator."""
         return len(self.buffer) > 0

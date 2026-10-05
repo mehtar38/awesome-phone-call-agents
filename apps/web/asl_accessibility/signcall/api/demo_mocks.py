@@ -1,25 +1,20 @@
 """
-Scripted answers that let the endpoint be driven end to end without spending
-a single real CALL-E call. Enabled only when SIGNCALL_API_DEMO_MOCKS=1.
+Scripted CALL-E answers that let the HTTP API run end to end without placing a
+call. Enabled only by SIGNCALL_API_DEMO_MOCKS=1.
 
-Why this has to be built per run rather than hardcoded: a mock resolver only
-receives `(task, phone)`, but calendar.slot_in_windows() checks a clinic's
-offered slot against THIS user's one-hour availability windows with an exact
-datetime containment test. A fixed slot would match one profile and fail
-every other one the frontend submits. So the resolver closes over the run's
-own UserInput and answers with that user's own first free hour -- formatted
-"HH:MM", since a clinic answering "2PM" would make datetime.fromisoformat()
-raise mid-run.
+The resolver is built per run because a clinic's offered slot is checked
+against this user's own free window by exact datetime containment, so a fixed
+slot would match one profile and fail every other. It answers with the user's
+own first free hour, formatted "HH:MM".
 
-Scripted outcome: the clinic accepts insurance, offers the user's own slot and
-says a photo ID is required, the family list declines, the first freelance
-interpreter is available, and once the user approves, the booking succeeds and
-that interpreter confirms. That's the full happy path; scenarios that exercise
-declines and dead ends live in frontend/text_harness.py.
+Scripted outcome: the clinic accepts insurance, offers the user's slot and says
+a photo ID is required; the family list declines; the first freelance
+interpreter is available; and once the user approves, the booking succeeds and
+that interpreter confirms. Declines and dead ends are covered by the scenarios
+in dev/text_harness.py.
 """
 
 from __future__ import annotations
-
 
 import threading
 
@@ -40,9 +35,9 @@ def _ok(structured: dict) -> CallResult:
 
 
 def build_resolver(user: UserInput, gate: "threading.Event | None" = None):
-    """`gate`, when given, blocks every mocked call until it's set -- the test
-    harness uses it to hold a run open long enough to prove the endpoint
-    refuses a concurrent second run."""
+    """`gate`, when given, blocks every mocked call until it is set; the test
+    harness uses it to hold a run open and prove a concurrent second run is
+    refused."""
     window = user.free_windows[0]
     slot_date = window.start.strftime("%Y-%m-%d")
     slot_time = window.start.strftime("%H:%M")
@@ -76,34 +71,23 @@ def build_resolver(user: UserInput, gate: "threading.Event | None" = None):
                 "minimum_hours": DEMO_MINIMUM_HOURS,
             })
         if purpose is CallPurpose.FAMILY_AVAILABILITY:
-            # Declining keeps the demo on the freelance path, which is the
-            # fuller sequence.
+            # Declining keeps the demo on the freelance path, the fuller sequence.
             return _ok({"coverable_slots": []})
         if purpose is CallPurpose.FAMILY_CONFIRM:
-            # Unreachable in this scripted run (family never locks in above),
-            # kept for completeness so a future script change doesn't KeyError.
             return _ok({"confirmed": True})
-        if purpose in (CallPurpose.INTERPRETER_RELEASE, CallPurpose.FAMILY_RELEASE):
-            # cancel_appointment()'s release calls -- nothing to return, they
-            # don't read structured_result at all.
-            return _ok({})
-        return _ok({})
+        return _ok({})  # release calls read nothing back
 
     return resolver
 
 
 def build_cancel_resolver():
-    """Scripted answers for cancel_appointment()'s calls, registered by
-    api/server.py's _execute_cancel() the same way build_resolver() above is
-    registered by _execute(). A separate, simpler resolver rather than
-    reusing build_resolver(): a cancellation can run long after the
-    original UserInput object is gone (see cancel_appointment()'s
-    docstring), and CLINIC_CANCEL/INTERPRETER_RELEASE/FAMILY_RELEASE never
-    need calendar-aware answers the way the original booking calls do."""
+    """Scripted answers for cancel_appointment()'s calls. Separate from
+    build_resolver() because a cancellation can run long after the original
+    UserInput is gone, and needs no calendar-aware answers."""
 
     def resolver(task: str, phone: str, purpose: CallPurpose) -> CallResult:
         if purpose is CallPurpose.CLINIC_CANCEL:
             return _ok({"cancelled": True})
-        return _ok({})  # INTERPRETER_RELEASE / FAMILY_RELEASE read nothing back
+        return _ok({})  # release calls read nothing back
 
     return resolver

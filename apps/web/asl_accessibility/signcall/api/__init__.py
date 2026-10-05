@@ -1,9 +1,8 @@
 """
-The HTTP seam. The frontend (built separately, not in this repo) POSTs its
-user-input JSON here and polls for the result.
+The HTTP layer. The frontend (../asl-recognition) POSTs its user-input JSON
+here and polls for the result.
 
-Deliberately thin: validation is workflow/user_input.py's job, the run is
-workflow/appointment.py's job, and this package only turns an HTTP request
-into a call to those. Nothing about the workflow knows it's being driven over
-HTTP.
+Deliberately thin: validation is workflow/user_input.py's job and the run is
+workflow/appointment.py's. This package only turns HTTP requests into calls to
+those, and nothing in the workflow knows it is being driven over HTTP.
 """

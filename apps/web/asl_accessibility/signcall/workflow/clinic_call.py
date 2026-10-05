@@ -1,30 +1,21 @@
 """
-Everything that talks to a clinic. Two distinct moments:
+Everything that talks to a clinic:
 
-  search_clinics()  -- Step 2, "which nearby clinic accepts insurance at all
-                       AND has a slot the user can actually attend?" Up to 10
-                       clinics (found by clinic_lookup.py, not supplied by the
-                       user), called one at a time nearest-first, stopping at
-                       the first match.
-  book_slot()       -- Step 5, the real booking, placed only after the user
-                       has approved the proposed appointment.
-  cancel_booking()  -- undoes that booking if every freelance interpreter
-                       then declines the final confirmation.
+  search_clinics()  Step 2: call nearby clinics one at a time, nearest first,
+                    until one accepts the patient's insurance and offers a
+                    slot they can attend.
+  book_slot()       Step 5: the real booking, placed only after the user
+                    approves the proposal.
+  cancel_booking()  Undoes a booking: when every interpreter then declines, or
+                    when the user cancels later.
 
-What each leg may say about the patient differs, deliberately:
-
-  - The SEARCH leg asks only whether the clinic accepts insurance as a matter
-    of policy, and volunteers nothing about the patient. Ten clinics get
-    called and nine of them are never used; none of them needs a name.
-  - The BOOKING leg gives the clinic the patient's name, date of birth, age,
-    phone and insurance provider + policy number. A real clinic cannot book an
-    anonymous appointment, and this is the one clinic that ends up holding the
-    appointment.
-
-Ordering: the clinic is booked BEFORE any freelance interpreter is asked to
-commit, because a patient booking is normally free to cancel and an
-interpreter engagement isn't. Neither happens until the user approves (see
-workflow/confirmation.py).
+What each call may say about the patient differs on purpose. The search calls
+ask only whether the clinic accepts insurance and share the user's free times;
+most of the clinics called are never used, so none gets a name. Only the
+booking call gives the chosen clinic the patient's name, date of birth, age,
+phone and insurance details. The clinic is booked before any freelance
+interpreter is asked to commit, because a patient booking is normally free to
+cancel and an interpreter engagement is not.
 """
 
 from ..calle.run import CallPurpose, call_and_wait
@@ -38,6 +29,9 @@ from .types import (
     clean_strings,
     distance_sort_key,
 )
+
+# The most clinics a search will phone before giving up.
+MAX_CLINICS_CALLED = 10
 
 _REQUIREMENTS_FIELD = {
     "type": "array",
@@ -120,22 +114,12 @@ CLINIC_CANCEL_SCHEMA = {
 def ask_insurance_then_slots(
     clinic: ClinicCandidate, user: UserInput, batch_position: int | None = None
 ) -> ClinicCandidate:
-    """
-    ONE call per clinic. The task asks the insurance-acceptance question
-    first and only asks about open slots if the answer is yes, so a clinic
-    that doesn't take insurance is never asked about appointments -- the
-    branch happens inside the conversation, which is why this is one call
-    and not two (and why the spec's 10-clinic ceiling costs ~10 calls).
-
-    This call shares the insurance PROVIDER (if asked) and the user's free
-    times. Everything else about the patient is held back for the booking
-    call, once a clinic is actually chosen.
-
-    Mutates and returns `clinic`, mirroring how the freelance search fills in
-    rate/minimum-hours.
-    """
+    """One call per clinic. The task asks about insurance first and only asks
+    about slots if the answer is yes, so the branch happens inside the
+    conversation. Shares the insurance provider (if asked) and the user's free
+    times, nothing else. Fills in and returns `clinic`."""
     task = (
-        "Start by saying: 'I am calling on behalf of a deaf or hard of hearing "
+        "Start by saying: 'I am an AI agent calling on behalf of a deaf or hard of hearing "
         "person. Please help accommodate their needs as best you can.' "
         "Ask whether the clinic accepts the patient's insurance. If they ask "
         f"which insurance it is, say {user.insurance.provider_name}. If they ask "
@@ -162,17 +146,14 @@ def ask_insurance_then_slots(
         batch_position=batch_position, purpose=CallPurpose.CLINIC_SEARCH,
     )
     if not result.task_completed:
-        # No answer / voicemail / the call never got an answer out of them.
-        # Explicitly NOT the same as "declines insurance": leaving
-        # accepts_insurance as None keeps those two distinguishable in the
-        # evidence trail, where a bare .get() would silently collapse a
-        # voicemail into a policy decline.
+        # No answer or voicemail. accepts_insurance stays None so this can be
+        # told apart from a clinic that said no.
         return clinic
     clinic.accepts_insurance = bool(result.structured_result.get("accepts_insurance", False))
     clinic.requirements = clean_strings(result.structured_result.get("requirements"))
     clinic.notes = append_note(clinic.notes, result.structured_result.get("additional_notes"))
     if not clinic.accepts_insurance:
-        return clinic  # skipped without ever being asked about slots
+        return clinic
     raw_slots = result.structured_result.get("available_slots") or []
     clinic.offered_slots = [
         ClinicSlot(date=s["date"], time=s["time"])
@@ -185,25 +166,13 @@ def ask_insurance_then_slots(
 def search_clinics(
     clinics: list[ClinicCandidate],
     user: UserInput,
-    max_clinics: int = 10,
+    max_clinics: int = MAX_CLINICS_CALLED,
 ) -> "tuple[ClinicCandidate | None, list[ClinicSlot]]":
-    """
-    Step 2. Calls clinics one at a time, nearest first, capped at
-    `max_clinics`, and stops at the first that accepts insurance and offers a
-    slot the user can attend. The calls are sequential, so the nearest match
-    is by construction the first one -- nothing is gained by calling further
-    down the list once a clinic has matched.
-
-    Satisficing, not optimizing: the nearest clinic that works wins, even if a
-    farther one would have offered a better time.
-
-    Distances can be None (a ZIP outside the Nevada centroid table), so the
-    ordering goes through types.distance_sort_key -- a bare
-    `key=lambda c: c.distance_miles` raises TypeError the moment one is.
-    """
+    """Calls up to `max_clinics`, nearest first, one at a time, and stops at
+    the first that accepts insurance and offers a slot the user can attend.
+    Satisficing: the nearest clinic that works wins, even if a farther one
+    would have offered a better time. Returns (None, []) if none match."""
     shortlist = sorted(clinics, key=lambda c: distance_sort_key(c.distance_miles))[:max_clinics]
-    # `position` is the clinic's index in the list; in real mode it picks the
-    # demo test line, cycling through the three.
     for position, clinic in enumerate(shortlist):
         ask_insurance_then_slots(clinic, user, batch_position=position)
         if not clinic.accepts_insurance:
@@ -215,20 +184,10 @@ def search_clinics(
 
 
 def book_slot(clinic: ClinicCandidate, slot: ClinicSlot, user: UserInput) -> dict:
-    """Step 5. The real booking, placed only after the user has approved the
-    proposal -- which is why the prompt can say the patient has been told what
-    the clinic said is required.
-
-    This is the one clinic call that identifies the patient: the clinic is
-    given the name, date of birth, age, phone and insurance details it needs
-    to put an appointment in its book.
-
-    The user approved a SPECIFIC date and time -- everyone downstream
-    (family, interpreter, the confirmation texts) is told exactly that slot,
-    not whatever the clinic ends up actually booking. So a different date or
-    time offered on this call is refused outright, not accepted as a
-    substitute: see the task text and _require_booked() below.
-    """
+    """Books the approved slot. The only clinic call that identifies the
+    patient. A different date or time offered on the call is refused, not
+    accepted as a substitute: everyone downstream is told exactly the slot the
+    user approved."""
     informed = (
         f"When we checked availability, the clinic said these are required for "
         f"the appointment: {'; '.join(clinic.requirements)}. The patient has "
@@ -238,7 +197,7 @@ def book_slot(clinic: ClinicCandidate, slot: ClinicSlot, user: UserInput) -> dic
         else ""
     )
     task = (
-        "Start by saying: 'I am calling on behalf of a deaf or hard of hearing "
+        "Start by saying: 'I am an AI agent calling on behalf of a deaf or hard of hearing "
         "person. We called earlier to check availability, and we would like to "
         "book the appointment.' "
         f"Book the {slot.date} {slot.time} appointment -- and ONLY that "
@@ -268,18 +227,11 @@ def book_slot(clinic: ClinicCandidate, slot: ClinicSlot, user: UserInput) -> dic
 
 
 def _require_booked(result, slot: ClinicSlot) -> None:
-    """A failed, voicemail'd, or declined clinic call must never be treated
-    as a successful booking -- and neither may a booking for a DIFFERENT date
-    or time than the one the user actually approved, even if the clinic
-    agent reports booked=true. A real, confirmed bug: the calling agent once
-    accepted a clinic's alternate-day offer and reported success, and nothing
-    here checked WHICH day was actually confirmed -- the workflow went on to
-    tell the interpreter and the user about the original, never-booked slot.
-
-    The clinic is booked before any interpreter is asked to commit, so a
-    failure here leaves nothing of OURS to undo -- but the clinic's own
-    system may already reflect the alternate slot from earlier in the same
-    call, which is called out explicitly below."""
+    """Raises unless the clinic really booked the exact slot the user approved.
+    A failed, unanswered or declined call is not a booking, and neither is a
+    booking the clinic reports for a different date or time. The clinic is
+    booked before any interpreter commits, so a failure leaves nothing of ours
+    to undo."""
     structured = result.structured_result
     booked = bool(result.task_completed and structured.get("booked"))
     confirmed_date = structured.get("confirmed_date")
@@ -321,21 +273,13 @@ def cancel_booking(
     patient_name: str,
     booking_reference: str | None = None,
 ) -> bool:
-    """Undoes a booking made by book_slot() -- either because every
-    interpreter who might have covered it (family, then freelance) declined
-    the final confirmation, or because the user cancelled an already-booked
-    appointment outright (see appointment.cancel_appointment()). Returns
-    whether the clinic confirmed the cancellation, so the caller can tell
-    the user if it didn't.
-
-    Takes `patient_name` rather than a full UserInput: this is the one piece
-    of the patient's identity a cancel call actually needs, and a
-    user-initiated cancellation may run long after the original UserInput
-    object existed -- only the succeeded run's own stored result survives
-    that long (see cancel_appointment()'s docstring)."""
+    """Cancels a booking made by book_slot(). Returns whether the clinic
+    confirmed, so the caller can tell the user if it didn't. Takes only the
+    patient's name rather than a UserInput, because a user-initiated
+    cancellation can run long after the original run's objects are gone."""
     reference = f", booking reference {booking_reference}" if booking_reference else ""
     task = (
-        "Start by saying: 'I am calling on behalf of a deaf or hard of hearing "
+        "Start by saying: 'I am an AI agent calling on behalf of a deaf or hard of hearing "
         "person. We booked an appointment with you earlier and need to cancel "
         "it.' "
         f"Cancel the {slot.date} {slot.time} appointment for {patient_name}{reference}. "

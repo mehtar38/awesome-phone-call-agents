@@ -1,36 +1,20 @@
 """
-Placing calls for real. Everything internal to the workflow goes through
-`call_and_wait()` here -- it's the only function in this package that
-actually reaches CALL-E's API. There is no separate plan/run step: the SDK's
-`calls.create()` creates and dispatches a call in a single request.
+The CALL-E adapter. `call_and_wait()` is the only function in this package that
+reaches CALL-E's API; everything in workflow/ goes through it.
 
-Real-mode setup:
-    pip install calle-ai              # requires Python >= 3.11
-    export CALLE_API_KEY=...          # from your CALL-E account dashboard --
-                                       # NOT the same credential as the CLI's
-                                       # browser OAuth login (different auth
-                                       # domain: api.heycall-e.com vs the
-                                       # CLI's seleven-mcp-sg.airudder.com)
+The SDK's `calls.create()` creates and dispatches a call in one request, so
+there is no separate plan/run step. The SDK's own `wait_for_result()` treats
+only {"completed", "failed", "canceled"} as terminal, which would make a call
+that hits voicemail or goes unanswered poll for the full default timeout, so
+`call_and_wait()` polls against a wider, case-insensitive terminal set.
 
-Verified against the actual installed SDK (not assumed from docs):
-    CalleClient(api_key=...).calls.create(task=..., recipient={"phone": ...},
-        result_schema=..., ...) -> dict
-    .get(call_id) -> dict
-
-The SDK's own built-in `create_and_wait()`/`wait_for_result()` only treats
-{"completed", "failed", "canceled"} as terminal (see calle/calls.py in
-site-packages) -- CALL-E's own CLI docs list a wider terminal set
-(COMPLETED, FAILED, NO_ANSWER, DECLINED, CANCELED, CANCELLED, VOICEMAIL,
-BUSY, EXPIRED, and cased differently). Relying on the SDK's narrower
-built-in wait would mean a call that goes to voicemail or isn't answered
-silently polls for the full default timeout (10 minutes) before giving up.
-`call_and_wait()` below does its own polling against the fuller,
-case-insensitive terminal set instead.
+Real mode needs `CALLE_API_KEY` and `SIGNCALL_TEST_LINES` (see below).
 """
 
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -54,29 +38,13 @@ class CallPurpose(str, Enum):
     INTERPRETER_CONFIRM = "interpreter_confirm"
     INTERPRETER_RELEASE = "interpreter_release"
 
-# Every purpose that reaches a family member. All three ring the number as
-# entered in the user's profile -- see resolve_call_target.
+
+# These ring the family member's own number, as entered in the user's profile.
 _FAMILY_PURPOSES = frozenset({
     CallPurpose.FAMILY_AVAILABILITY, CallPurpose.FAMILY_CONFIRM, CallPurpose.FAMILY_RELEASE,
 })
 
-# Sourced from CALL-E's CLI documentation (references/commands.md, in the
-# `calle` skill) as of 2026-09-12, normalized to uppercase since the
-# SDK's own wait_for_result() checks a different, lowercase, narrower set
-# (see calle/calls.py in site-packages). Correction from an earlier
-# version of this comment: a 2026-09-13 audit checked this against the
-# SDK's own *generated* OpenAPI models (calle/generated/models/
-# call_status.py) and found they define only
-# canceled/completed/failed/in_progress/queued -- none of NO_ANSWER,
-# VOICEMAIL, BUSY, DECLINED, or EXPIRED appear anywhere in the installed
-# package. So this is NOT a "confirmed inconsistency" the way it was
-# previously described -- it's unconfirmed beyond the CLI docs, which
-# have since been uninstalled (this app is SDK-only) and can't be
-# re-checked from this machine. The set is left as-is since it's a
-# harmless superset (the real terminal set is fully covered by
-# COMPLETED/FAILED/CANCELED per the generated models) -- but re-verify
-# against CALL-E's current developer docs directly if this is ever load-
-# bearing, rather than trusting this comment's history.
+# A superset of the statuses the SDK documents; extras are harmless if never returned.
 TERMINAL_STATUSES = {
     "COMPLETED", "FAILED", "NO_ANSWER", "DECLINED",
     "CANCELED", "CANCELLED", "VOICEMAIL", "BUSY", "EXPIRED",
@@ -85,16 +53,6 @@ TERMINAL_STATUSES = {
 
 @dataclass
 class CallResult:
-    """Mirrors the shape returned by CALL-E's SDK / get_call_run, mapped
-    from the real API's raw dict. Checked against two live calls on
-    2026-09-13, not just the documented shape -- that checking found and
-    fixed two real bugs (see _extract_confidence and
-    _extract_transcript_turns below). Still unverified: the actual TYPES
-    of `evidence` (assumed list[str]) and `task_completed` (assumed bool)
-    -- both calls returned the expected types, but nothing has forced the
-    alternate case yet, so the .get() fallbacks stay defensive rather than
-    assumed-safe."""
-
     status: str
     task_completed: bool
     completion_confidence: float
@@ -103,7 +61,7 @@ class CallResult:
     transcript_turns: list[dict] = field(default_factory=list)
 
 
-_client = None  # lazily constructed real CalleClient, real mode only
+_client = None
 _client_lock = threading.Lock()
 
 
@@ -111,28 +69,23 @@ def _get_client():
     global _client
     with _client_lock:  # calls can start on several threads at once
         if _client is None:
-            import calle as calle_sdk  # the REAL SDK -- resolvable because this
-                                         # app is invoked as `signcall.*`, never
-                                         # with apps/signcall/ itself on sys.path
-                                         # (see README for the naming-collision
-                                         # note and the correct run command)
+            # Imported here, not at module level: this must resolve to the real
+            # SDK, which only works when the app is run as `signcall.*` from the
+            # directory above signcall/ (see README, "Running the code").
+            import calle as calle_sdk
+
             api_key = os.environ.get("CALLE_API_KEY")
             if not api_key:
                 raise RuntimeError(
-                    "CALLE_API_KEY is not set. Get one from your CALL-E account "
-                    "dashboard (this is separate from the CLI's browser login) "
-                    "and `export CALLE_API_KEY=...` before running in real mode."
+                    "CALLE_API_KEY is not set. Create a key in your CALL-E account "
+                    "dashboard and set it before running in real mode."
                 )
             _client = calle_sdk.CalleClient(api_key=api_key)
         return _client
 
 
 def _extract_confidence(raw_value) -> float:
-    """`completion_confidence` is a dict on the real API (confirmed against
-    a live response on 2026-09-13, not the plain float the docs implied --
-    this crashed float() outright on the first real call before this fix).
-    Handles both shapes defensively since which one is authoritative
-    wasn't independently confirmed anywhere else."""
+    """The live API returns {"score": ...}; accept a plain number too."""
     if isinstance(raw_value, dict):
         score = raw_value.get("score", 0.0)
         return float(score) if score is not None else 0.0
@@ -140,19 +93,13 @@ def _extract_confidence(raw_value) -> float:
 
 
 def _extract_transcript_turns(raw: dict) -> list[dict]:
-    """Real shape, confirmed against a live response on 2026-09-13: nested
-    under recipients[0].attempts[-1], not a top-level key (which doesn't
-    exist at all -- the original .get("transcript_turns") silently
-    returned [] every time, never actually broken loudly). Single-
-    recipient assumption matches how call_and_wait() is always invoked
-    today; revisit if/when true batch recipients=[...] calls are added."""
+    """Turns live under recipients[0].attempts[-1]; empty if that path is absent."""
     recipients = raw.get("recipients") or []
     if not recipients or not isinstance(recipients[0], dict):
-        return []  # type guard added after edge-case testing confirmed
-                    # recipients[0] being a non-dict crashes .get() outright
+        return []
     attempts = recipients[0].get("attempts") or []
     if not isinstance(attempts, list) or not attempts or not isinstance(attempts[-1], dict):
-        return []  # same class of guard for attempts
+        return []
     return attempts[-1].get("transcript_turns") or []
 
 
@@ -181,14 +128,9 @@ def _poll_until_terminal(client, call_id: str, timeout_seconds: float = 600.0) -
         time.sleep(2.0)
 
 
-# A shared/free CALL-E line runs only ONE call at a time on the account's
-# behalf -- this app's own batch code fires several "at once" on purpose (see
-# interpreter_matching.py), so everyone past the first hits this cap instead
-# of a queued call. It is an account-level limit, not a bug: a dedicated
-# number raises it to 10 concurrent, but nothing here requires buying one --
-# waiting for the line to free up (a call typically runs under two minutes)
-# and trying again gets the same batch through, just staggered instead of
-# simultaneous.
+# An account without a dedicated outbound number runs one call at a time, so
+# parallel calls past the first hit CALL-E's concurrency limit. Waiting and
+# retrying runs the same calls staggered instead of failing them.
 CONCURRENCY_RETRY_INTERVAL_SECONDS = 10.0
 CONCURRENCY_RETRY_DEADLINE_SECONDS = float(
     os.environ.get("CALLE_CONCURRENCY_RETRY_DEADLINE_SECONDS", "300")
@@ -196,19 +138,14 @@ CONCURRENCY_RETRY_DEADLINE_SECONDS = float(
 
 
 def _is_concurrency_limit_error(exc: Exception) -> bool:
-    """CALL-E's own wording for this ("...is at its account concurrency "
-    limit of N...") is matched on substring rather than a status code or
-    error `code` field, since neither was confirmed against a live response
-    -- see the module docstring's policy on unverified assumptions."""
+    # Matched on CALL-E's message text; no stable error code is documented.
     message = getattr(exc, "message", None)
     return isinstance(message, str) and "concurrency limit" in message.lower()
 
 
 def _create_call_with_concurrency_retry(client, **kwargs) -> dict:
-    """client.calls.create(), but a concurrency-limit error waits and tries
-    again instead of failing the whole batch outright. Every other error
-    (auth, a malformed request, a real outage) still raises immediately."""
-    import calle as calle_sdk  # see _get_client() for why this is deferred
+    """`calls.create()`, retrying only on the concurrency-limit error."""
+    import calle as calle_sdk  # see _get_client()
 
     deadline = time.monotonic() + CONCURRENCY_RETRY_DEADLINE_SECONDS
     while True:
@@ -220,34 +157,44 @@ def _create_call_with_concurrency_retry(client, **kwargs) -> dict:
             time.sleep(CONCURRENCY_RETRY_INTERVAL_SECONDS)
 
 
-# --- Demo call routing (REAL mode only) ---------------------------------
+# --- Real-mode call routing -------------------------------------------------
 #
-# Clinics and freelance interpreters are only ever rung on one of the three
-# test lines below, all owned by the project's own user. Clinic numbers are
-# real (clinic_lookup fetches them from Google Maps via Apify) and roster
-# numbers are synthetic; neither is ever dialed. The logical recipient still
-# drives the task text, the mock lookup, and the evidence trail -- only the
-# number the SDK is handed is substituted.
+# Clinic and interpreter numbers are never dialled directly. In real mode each
+# is mapped onto one of the phones listed in SIGNCALL_TEST_LINES, which the
+# operator owns. The logical recipient still drives the task text, the mock
+# lookup and the evidence trail; only the number handed to the SDK changes.
+# Family numbers were entered by the user in their own profile and are dialled
+# as given.
 #
-# Family calls are the exception: those numbers were entered by the user in
-# their own profile, so they are dialed as given (see resolve_call_target).
-#
-# Recipients are assigned a line by their POSITION within the group being
-# worked through (the clinic list, or a batch of 3 interpreters), and the
-# assignment is STICKY: the clinic searched on line 2 is booked on line 2, and
-# an interpreter confirmed on line 3 was asked on line 3.
+# A recipient's line is chosen by its position within the group being called
+# (the clinic list or an interpreter batch) and is then sticky, so a clinic
+# searched on line 2 is booked on line 2.
 
-DEMO_TEST_LINES = ("+19496780146", "+19496780146", "+19496780146")
+TEST_LINES_ENV = "SIGNCALL_TEST_LINES"
+_E164 = re.compile(r"^\+[1-9]\d{6,14}$")
 
 _line_assignments: dict[str, str] = {}
 _routing_lock = threading.Lock()
 
-# A phone can't take two calls at once, so calls to the same number queue while
-# calls to different numbers run in parallel. This matters here because the
-# whole roster shares the three test lines, so two candidates in one parallel
-# batch can resolve to the same line.
+# One phone can't take two calls at once: calls to the same number queue,
+# calls to different numbers run in parallel.
 _dial_locks: dict[str, threading.Lock] = {}
 _dial_locks_guard = threading.Lock()
+
+
+class CallRoutingError(RuntimeError):
+    """Raised instead of guessing a line, so a missing or malformed setting
+    can't silently send calls somewhere unintended."""
+
+
+def test_lines() -> tuple[str, ...]:
+    """The phones real-mode calls are routed to, from SIGNCALL_TEST_LINES
+    (comma-separated E.164 numbers). Read on every call so tests can change it."""
+    lines = tuple(n.strip() for n in os.environ.get(TEST_LINES_ENV, "").split(",") if n.strip())
+    bad = [n for n in lines if not _E164.match(n)]
+    if bad:
+        raise CallRoutingError(f"{TEST_LINES_ENV} has entries that are not E.164 numbers: {bad}")
+    return lines
 
 
 def _dial_lock(dial_target: str) -> threading.Lock:
@@ -255,38 +202,34 @@ def _dial_lock(dial_target: str) -> threading.Lock:
         return _dial_locks.setdefault(dial_target, threading.Lock())
 
 
-class CallRoutingError(RuntimeError):
-    """Raised instead of guessing a line. A silent default would be how this
-    invariant rots -- the first unthreaded call site would quietly send every
-    call to line 1 and nothing would notice."""
-
-
 def reset_call_routing() -> None:
-    """Called at the top of every run. Without this, a second run in the same
-    process inherits the first run's line assignments."""
+    """Clears line assignments. Called at the start of every run."""
     with _routing_lock:
         _line_assignments.clear()
 
 
 def resolve_dial_target(logical_phone: str, batch_position: int | None = None) -> str:
-    """The number actually dialed in real mode. Pure and mode-independent so
-    it can be tested directly -- the test harness process is permanently mock
-    (MOCK_MODE is bound at import), so this could not otherwise be exercised.
-
-    Never returns `logical_phone`: the result is always a DEMO_TEST_LINES
-    entry."""
+    """The number actually dialled for a clinic or interpreter: always one of
+    the configured test lines, never `logical_phone`. Pure and independent of
+    mock mode, so it can be tested directly."""
     with _routing_lock:
         assigned = _line_assignments.get(logical_phone)
         if assigned is not None:
-            return assigned  # stickiness wins over position
+            return assigned
+        lines = test_lines()
+        if not lines:
+            raise CallRoutingError(
+                f"{TEST_LINES_ENV} is not set. Real-mode clinic and interpreter calls "
+                f"are only placed to phones you own: set it to one or more "
+                f"comma-separated E.164 numbers."
+            )
         if batch_position is None:
             raise CallRoutingError(
                 f"No test line assigned for {logical_phone!r} and no batch_position "
-                f"given. Every call site must pass its index within the group it's "
-                f"calling (clinic list, family list or interpreter batch) the first "
-                f"time it reaches a recipient -- refusing to guess a line."
+                f"given. Every call site must pass the recipient's index within the "
+                f"group it is calling the first time it reaches them."
             )
-        line = DEMO_TEST_LINES[batch_position % len(DEMO_TEST_LINES)]
+        line = lines[batch_position % len(lines)]
         _line_assignments[logical_phone] = line
         return line
 
@@ -294,36 +237,25 @@ def resolve_dial_target(logical_phone: str, batch_position: int | None = None) -
 def resolve_call_target(
     logical_phone: str, purpose: CallPurpose, batch_position: int | None = None
 ) -> str:
-    """The number a real-mode call actually dials. A family call -- whether
-    it's the availability ask or the later binding confirm -- rings the
-    family member's own number, exactly as the user entered it in their
-    profile. Every other call goes to a test line (see resolve_dial_target)."""
+    """The number a real-mode call dials: the family member's own number for
+    family calls, a test line for everything else."""
     if purpose in _FAMILY_PURPOSES:
         return logical_phone
     return resolve_dial_target(logical_phone, batch_position)
 
 
-# --- Mock mode plumbing (unchanged) -------------------------------------
+# --- Mock mode ----------------------------------------------------------------
 
 MockResolver = Callable[[str, str, CallPurpose], CallResult]  # (task, phone, purpose)
 
 _mock_resolvers: dict[str, MockResolver] = {}
-
-
 _default_mock: MockResolver | None = None
 
 
 def register_default_mock(resolver: MockResolver) -> None:
-    """A catch-all used ONLY when no per-number mock matches.
-
-    Exists so the HTTP endpoint can be exercised end to end without spending
-    real calls on clinic and interpreter numbers that aren't known until the
-    search returns them. It is registered per run and cleared immediately
-    afterwards -- never at import -- because several test scenarios
-    deliberately leave a number unmocked so that reaching it raises KeyError
-    loudly. A default left lying around would turn those tripwires into quiet
-    successes.
-    """
+    """A catch-all used only when no per-number mock matches. It is registered
+    per run and cleared afterwards, never at import: tests deliberately leave
+    some numbers unmocked so that reaching them raises KeyError."""
     global _default_mock
     _default_mock = resolver
 
@@ -334,14 +266,20 @@ def clear_default_mock() -> None:
 
 
 def register_mock(phone: str, resolver: MockResolver) -> None:
-    """
-    Test harnesses (see frontend/text_harness.py) call this to script what
-    a specific phone number "says" when called with a given task. This is
-    the whole mechanism that lets Phase 3 fan-out, Phase 4 decline/retry,
-    and the rare-reversal path all be exercised with typed text and zero
-    real CALL-E credits.
-    """
+    """Scripts what `phone` says when called. This is how the test harness
+    exercises every workflow path without spending credits."""
     _mock_resolvers[phone] = resolver
+
+
+# Appended to every call's task. Calls are billed per second and a voice agent
+# left alone pads: restating questions, long thanks, small talk.
+CALL_STYLE = (
+    "Be brief: short sentences, no small talk, no repeating yourself. Once you "
+    "have the answers asked for, thank them once and end the call immediately. "
+    "Only discuss scheduling and logistics: give no medical, legal or financial "
+    "advice. If the other person describes an emergency, tell them to call 911 "
+    "and end the call."
+)
 
 
 def call_and_wait(
@@ -352,35 +290,21 @@ def call_and_wait(
     *,
     purpose: CallPurpose,
 ) -> CallResult:
-    """
-    The one function everything in workflow/ actually calls.
+    """Place one call and block until it finishes. `phone` is the LOGICAL
+    recipient (clinic, interpreter or family member). In mock mode it selects
+    the scripted response; in real mode it is mapped to the number to dial by
+    resolve_call_target(). `batch_position` is the recipient's index within
+    its group and is required the first time they are reached.
 
-    `phone` is the LOGICAL recipient -- the clinic, interpreter or family
-    member this call is about. In mock mode it selects the scripted response.
-    In real mode, for a clinic or interpreter it is NOT dialed:
-    resolve_call_target() maps it onto one of the owned test lines, so a real
-    rehearsal can never ring a real clinic. A family call dials the family
-    member's own number. `batch_position`
-    is the recipient's index within the group being called and is required the
-    first time a given recipient is reached.
-
-    `purpose` says what the call is for; mock resolvers dispatch on it.
-
-    Real mode places an actual phone call and blocks until it reaches a
-    terminal status. Safe to call from several threads at once: calls to
-    different numbers run in parallel, calls to the same number queue --
-    though a shared/free CALL-E line only actually places ONE call at a time
-    regardless (see _create_call_with_concurrency_retry above), so several
-    threads calling different numbers may still be staggered by the
-    account's own concurrency cap rather than truly simultaneous.
-    """
+    Safe to call from several threads: calls to different numbers run in
+    parallel, calls to the same number queue."""
+    task = f"{task} {CALL_STYLE}"
     if MOCK_MODE:
         resolver = _mock_resolvers.get(phone) or _default_mock
         if resolver is None:
             raise KeyError(
                 f"No mock registered for {phone!r}. Call "
-                f"calle.run.register_mock({phone!r}, ...) in your test "
-                f"harness before exercising this path."
+                f"register_mock({phone!r}, ...) in the test harness first."
             )
         return resolver(task, phone, purpose)
 

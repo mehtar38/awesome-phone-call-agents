@@ -1,35 +1,19 @@
 """
-All Gemini API calls live here, kept server-side on purpose: an API key must
-never sit in browser JS where anyone can read it out of dev tools. Two jobs:
+Gemini calls, kept server-side so the API key never reaches browser JS.
 
-1. extract_card_fields() -- reads an ID or insurance card photo, returns the
-   structured profile fields. Replaces an earlier plan to do this client-side
-   with Tesseract.js OCR + regex; once a Gemini-backed endpoint existed anyway
-   for booking-transcript parsing, reusing it here is both less code and much
-   more reliable than parsing raw OCR text with hand-written regexes.
+- extract_card_fields(): reads an ID or insurance card photo and returns profile fields.
+- parse_booking_transcript(): turns the confirmed sign or typed transcript into
+  structured availability, resolving relative days ("Tuesday") against today's date.
 
-2. parse_booking_transcript() -- reads the confirmed sign/typed transcript,
-   resolves relative day references ("Tuesday") against today's real date,
-   and returns the structured availability the confirm screen shows back to
-   the user for a final check before it's ever sent to the backend.
-
-Uses the current `google-genai` SDK (the package Google actively supports --
-the older `google-generativeai` package's support has ended). Model is
-gemini-2.5-flash: current, multimodal (needed for the card-image job), and
-fast/cheap enough for both of these small, low-latency calls.
-
-NOTE: this sandbox's network is blocked from reaching Google's API, so
-neither function has been exercised against a live key here -- the SDK call
-shapes below were checked directly against the installed google-genai
-package (Client.models.generate_content, types.Part.from_bytes), not
-guessed, but a real GEMINI_API_KEY is still needed to confirm end-to-end
-behavior. Smoke-test both endpoints before the demo.
+Uses the `google-genai` SDK. Both prompts ask for strict JSON and tell the
+model to leave a field empty rather than guess.
 """
 import json
 import os
+import time
 
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 _client = None
 
@@ -41,12 +25,33 @@ def _get_client() -> genai.Client:
     return _client
 
 
-MODEL_NAME = "gemini-2.5-flash"
+# A "-latest" alias because pinned versions get retired for new keys (404).
+# Set GEMINI_MODEL to pin one.
+MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+# Tried only when MODEL_NAME stays overloaded (see _generate).
+FALLBACK_MODEL_NAME = "gemini-flash-lite-latest"
+
+
+def _generate(contents):
+    """One generate_content call. On 429 or 503 each model is tried twice, then
+    the fallback model. Any other error (bad key, retired model) is raised at once."""
+    client = _get_client()
+    last_error = None
+    for model in dict.fromkeys([MODEL_NAME, FALLBACK_MODEL_NAME]):
+        for attempt in (1, 2):
+            try:
+                return client.models.generate_content(model=model, contents=contents)
+            except (errors.ServerError, errors.ClientError) as exc:
+                if getattr(exc, "code", None) not in (429, 503):
+                    raise
+                last_error = exc
+                if attempt == 1:
+                    time.sleep(1.5)
+    raise last_error
 
 
 def _strip_code_fence(text: str) -> str:
-    """Gemini often wraps JSON answers in ```json ... ``` even when told not
-    to -- strip that before json.loads() instead of fighting the prompt over it."""
+    """Gemini often wraps JSON in a ```json fence even when told not to."""
     text = text.strip()
     if text.startswith("```"):
         text = text.split("```")[1]
@@ -78,14 +83,10 @@ Rules:
 
 
 def extract_card_fields(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
-    client = _get_client()
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=[
-            CARD_PROMPT,
-            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-        ],
-    )
+    response = _generate([
+        CARD_PROMPT,
+        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+    ])
     return json.loads(_strip_code_fence(response.text))
 
 
@@ -111,6 +112,10 @@ prose before or after it, matching this schema exactly:
 }}
 
 - "time" must be 24-hour HH:MM.
+- clinic_type_hint: physical_therapy = physio/rehab/PT; mental = psychiatrist,
+  counselor, mental health; general = family/primary care doctor; ent = ear,
+  nose, throat; eyes = optometrist/eye doctor; dental = dentist. If the
+  wording fits more than one (e.g. just "therapy"), use null.
 - If no day is mentioned at all, use today's date for every timestamp.
 - If a field can't be determined from the transcript, use null (or an empty
   list for availability) -- never guess.
@@ -122,6 +127,5 @@ def parse_booking_transcript(transcript: str, today_iso: str, today_weekday: str
     prompt = BOOKING_PROMPT_TEMPLATE.format(
         transcript=transcript, today_iso=today_iso, today_weekday=today_weekday,
     )
-    client = _get_client()
-    response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+    response = _generate(prompt)
     return json.loads(_strip_code_fence(response.text))

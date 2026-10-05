@@ -2,26 +2,23 @@
 The orchestrator. `run_interpreter_mesh(user, approve=...)` runs the call
 sequence that books a clinic appointment together with an ASL interpreter:
 
-    STEP 1  validated user input          (0 calls -- see workflow/user_input.py)
-    STEP 2  search & match a clinic       (one at a time, nearest first, insurance-gated)
-    STEP 3  line up an interpreter        (own | family list | freelance, batches of interpreter_matching.DEFAULT_BATCH_SIZE -- dialled one after another unless PARALLEL_BATCH_CALLS is on, see that module's docstring)
-    STEP 4  ask the user                  (nothing is booked until they say yes)
-    STEP 5  book, confirm, notify         (clinic first, then a freelance
-                                           interpreter's binding confirm, then texts)
+    STEP 1  validated user input   (no calls; see user_input.py)
+    STEP 2  find and match a clinic (one at a time, nearest first, insurance-gated)
+    STEP 3  line up an interpreter  (the user's own, a family member, or a freelancer)
+    STEP 4  ask the user            (nothing is booked until they say yes)
+    STEP 5  book, confirm, notify   (clinic first, then the interpreter's binding
+                                     confirm, then confirmation texts)
 
-Clinics are FOUND, not supplied: clinic_lookup.find_clinics() turns the user's
-ZIP and appointment type into up to 10 nearby candidates. Freelance
-interpreters come from the seeded state roster within travel distance of the
-matched clinic. Both can still be injected for tests.
+Clinics and freelance interpreters are found by the workflow itself; both can
+also be injected, which is how the tests run without a network.
 
-Ordering is what keeps the fee-bearing commitment last. Nothing binding
-happens before the user approves; after that the clinic is booked first
-(a patient booking is normally free to cancel), and only then is the
-interpreter -- family or freelance -- asked to commit for real. A family
-member's "yes" during Step 3A was given to a slot that wasn't booked yet, so
-they get the same binding confirm call a freelancer does; if they decline, the
-next unreached family member is tried, then freelance interpreters for that
-one slot. If nobody confirms, the clinic booking is cancelled.
+The order is what keeps the fee-bearing commitment last. Nothing binding
+happens before the user approves. After that the clinic is booked first (a
+patient booking is normally free to cancel) and only then is the interpreter
+asked to commit. A family member's earlier "yes" was given for a slot that
+wasn't booked yet, so they get the same binding confirm; if they decline, the
+next family member is tried, then freelancers for that one slot. If nobody
+confirms, the clinic booking is cancelled.
 """
 
 from __future__ import annotations
@@ -33,7 +30,7 @@ from typing import NoReturn
 from ..calle.run import reset_call_routing
 
 from . import calendar, clinic_call, clinic_lookup, family_call, interpreter_lookup, interpreter_matching, reminders
-from .confirmation import ApprovalFn, BookingDeclined, BookingProposal
+from .confirmation import ApprovalFn, BookingDeclined, BookingProposal, NoMatchFound
 from .types import (
     AppointmentResult,
     ClinicCandidate,
@@ -55,18 +52,14 @@ class _Arrangement:
     family_tier_result: str
     evidence: list[str]
     family_member: FamilyInterpreter | None = None
-    # Family only: whoever is left on the list after family_member, in order
-    # -- never asked during the search (it stopped at the first yes), so
-    # they're available as a fallback if family_member declines the binding
-    # confirm.
+    # Family only: the members after `family_member`, who were never asked
+    # (the search stopped at the first yes) and are the fallback if it declines.
     remaining_family: list[FamilyInterpreter] = field(default_factory=list)
-    # Freelance only: the cheapest match first, then anyone else who named this
-    # same slot -- the fallbacks if the first declines the final confirmation.
+    # Freelance only: the cheapest match first, then anyone else in that batch
+    # who named the same slot, as fallbacks if the first declines.
     freelancers: list[InterpreterCandidate] = field(default_factory=list)
-    # Family only: the caller-supplied candidate pool (tests) or None ("go
-    # find them"), carried unresolved so the family-confirm fallback can
-    # search the SAME pool a freelance-first run would have -- never the real
-    # roster when a test injected a fake one.
+    # Family only: the caller-supplied candidate pool (tests) or None, carried
+    # unresolved so the family-confirm fallback searches the same pool.
     freelance_pool: list[InterpreterCandidate] | None = None
 
     def person(self) -> "FamilyInterpreter | InterpreterCandidate | None":
@@ -83,34 +76,30 @@ def run_interpreter_mesh(
     *,
     approve: ApprovalFn,
 ) -> AppointmentResult:
-    """
-    `approve` is asked once, with a BookingProposal, after a clinic and an
-    interpreter are lined up. Nothing is booked unless it returns True; if it
-    returns False (or raises BookingDeclined) the run ends with BookingDeclined.
+    """Runs the full sequence. `approve` is asked once, with a BookingProposal,
+    after a clinic and an interpreter are lined up; nothing is booked unless it
+    returns True (otherwise BookingDeclined is raised). NoMatchFound is raised
+    when no clinic or interpreter says yes.
 
-    `clinics` and `candidates` default to None, which means "go find them"
-    (clinic_lookup.find_clinics / interpreter_matching.load_candidates_within_radius).
-    Tests pass explicit lists instead so no network or roster lookup is
-    involved.
-    """
-
-    # Real-mode calls are routed onto the three owned demo lines, and those
-    # assignments must not leak between runs in the same process.
+    `clinics` and `candidates` default to None, meaning "go find them"; tests
+    pass explicit lists instead."""
+    # Real-mode line assignments must not leak between runs in one process.
     reset_call_routing()
 
-    # --- STEP 2: search & match a clinic ----------------------------------
+    # --- STEP 2: find and match a clinic ----------------------------------
     if clinics is None:
-        clinics = clinic_lookup.find_clinics(user.zipcode, user.appointment_type)
+        clinics = clinic_lookup.find_clinics(
+            user.zipcode, user.appointment_type, limit=clinic_call.MAX_CLINICS_CALLED
+        )
     if not clinics:
-        raise RuntimeError(
-            f"No {user.appointment_type.value} clinic could be found near "
-            f"{user.zipcode} -- nothing to call."
+        raise NoMatchFound(
+            f"We couldn't find any {user.appointment_type.value.replace('_', ' ')} "
+            f"clinics near {user.zipcode}."
         )
     clinic, matched = clinic_call.search_clinics(clinics, user)
     if clinic is None:
-        raise RuntimeError(
-            "No clinic in the search list both accepts insurance and has a "
-            "slot the user can attend -- nothing to book."
+        raise NoMatchFound(
+            "No clinic we called had a time that fits your schedule and insurance."
         )
 
     # --- STEP 3: line up an interpreter -----------------------------------
@@ -125,18 +114,15 @@ def run_interpreter_mesh(
 
 
 def describe_goal(user: UserInput) -> str:
-    """What the user is told will happen, and what will be shared. It has to
-    state the search breadth (up to 10 clinics, then family, then batches of
-    interpreters, interpreter_matching.DEFAULT_BATCH_SIZE at a time) and
-    exactly which personal details each kind of call gets, because the
-    user's submission is their consent. The batch size is read from that
-    same constant, never restated as a literal, so this text can't drift
-    from what search_freelancers_in_batches() actually does."""
+    """Plain-language statement of what a submitted request will do and what
+    each kind of call shares. Returned by POST /runs as `plan`. The search
+    breadth is read from the same constants the search uses, so this text
+    can't drift from the behavior."""
     provider = user.insurance.provider_name
     text = (
         f"Book a {user.appointment_type.value.replace('_', ' ')} appointment "
         f"near {user.zipcode} and secure an ASL interpreter for it. To do "
-        f"that I'll phone nearby clinics (up to 10, one at a time, nearest "
+        f"that I'll phone nearby clinics (up to {clinic_call.MAX_CLINICS_CALLED}, one at a time, nearest "
         f"first, stopping at the first that accepts your insurance and has a "
         f"time you're free). On those calls I'll say the "
         f"patient is deaf or hard of hearing, share your insurance provider "
@@ -175,12 +161,12 @@ def _arrange_interpreter(
     matched: list[ClinicSlot],
     candidates: list[InterpreterCandidate] | None,
 ) -> _Arrangement:
-    """Settles who will interpret, and for which of the matched slots, without
+    """Settles who will interpret, and for which matched slot, without
     committing anyone."""
     if user.has_interpreter:
-        # No contact details are collected for that interpreter, so nobody is
-        # called or texted for them. Their availability isn't collected either,
-        # so where several slots matched, one is picked at random.
+        # Nothing is collected about the user's own interpreter, so nobody is
+        # called or texted for them, and with several matched slots one is
+        # picked at random.
         return _Arrangement(
             slot=random.choice(matched),
             source="user_arranged",
@@ -200,8 +186,7 @@ def _arrange_interpreter(
                 source="family",
                 family_tier_result="locked_in",
                 family_member=member,
-                # Identity, not equality: two entries could otherwise share
-                # every field and be mistaken for each other.
+                # Matched by identity: two entries could share every field.
                 remaining_family=user.family[
                     next(i for i, m in enumerate(user.family) if m is member) + 1 :
                 ],
@@ -218,22 +203,16 @@ def _arrange_interpreter(
 def _resolve_freelance_pool(
     clinic: ClinicCandidate, candidates: list[InterpreterCandidate] | None
 ) -> list[InterpreterCandidate]:
-    """`candidates` is the caller-supplied pool (tests inject one), or None,
-    meaning "go find them": an Illinois clinic looks up Illinois's own live
-    interpreter registry (interpreter_lookup.find_interpreters_il()).
-    Everywhere else covered has no real interpreter source yet, so this
-    returns an empty pool rather than substituting fabricated interpreters --
-    _arrange_freelancer() turns an empty pool into a clear "no interpreter
-    could be found" error, which is the honest outcome when there's nothing
-    real to offer, not a fake name and number that looks like a real match.
-    (interpreter_matching.load_candidates_within_radius() -- the old seeded
-    synthetic roster -- still exists and is still tested, but only as a test
-    fixture for the matching algorithm; nothing in a live run calls it.)
-    Shared by the initial freelance search and the family-confirm fallback
-    so both ever look at the same pool for a given run."""
+    """The interpreters to ask: the caller's list if given (tests), otherwise a
+    live lookup. Only Illinois has a live source; elsewhere the pool is empty
+    and the run ends with "no interpreter found" rather than inventing one.
+    A live pool is capped at MAX_INTERPRETER_BATCHES batches to bound the
+    number of calls. Shared by the first freelance search and the family
+    fallback, so both draw on the same pool."""
     if candidates is None:
         if interpreter_lookup.is_illinois_zip(clinic.zipcode):
-            candidates = interpreter_lookup.find_interpreters_il(clinic.zipcode)
+            limit = interpreter_matching.MAX_INTERPRETER_BATCHES * interpreter_matching.DEFAULT_BATCH_SIZE
+            candidates = interpreter_lookup.find_interpreters_il(clinic.zipcode)[:limit]
         else:
             candidates = []
     return candidates
@@ -246,23 +225,17 @@ def _arrange_freelancer(
     candidates: list[InterpreterCandidate] | None,
 ) -> _Arrangement:
     """The batch search stops at the first batch with a match. Its cheapest
-    match is the one proposed; the rest of that batch who named the same slot
-    are kept as fallbacks for the final confirmation."""
+    match is proposed; the others in that batch who named the same slot are
+    kept as fallbacks for the final confirmation."""
     candidates = _resolve_freelance_pool(clinic, candidates)
     if not candidates:
-        raise RuntimeError(
-            f"No interpreter could be found for {clinic.name} ({clinic.zipcode}) "
-            f"-- nobody was called, and no clinic appointment was taken."
-        )
+        raise NoMatchFound(f"We couldn't find an interpreter near {clinic.zipcode}.")
 
     ranked = interpreter_matching.search_freelancers_in_batches(
         candidates, matched, clinic, batch_size=interpreter_matching.DEFAULT_BATCH_SIZE
     )
     if not ranked:
-        raise RuntimeError(
-            "No freelance interpreter in any batch can cover a matched slot "
-            "-- nothing booked, and no clinic appointment was taken."
-        )
+        raise NoMatchFound("No interpreter we called could cover that time.")
 
     slot = interpreter_matching.slot_for_candidate(ranked[0], matched)
     if slot is None:
@@ -286,12 +259,12 @@ def _freelancer_detail(candidate: InterpreterCandidate) -> dict:
     return {
         "tier": "freelance",
         "name": candidate.name,
-        "phone": candidate.phone,  # needed later if the user cancels -- see cancel_appointment()
+        "phone": candidate.phone,  # kept for cancel_appointment()
         "rate_per_hour": candidate.rate_per_hour,
         "minimum_hours": candidate.minimum_hours,
         "total_estimate": candidate.total_cost(),
         "expertise": candidate.expertise,
-        "source": candidate.source,  # "seeded_roster" | "il_directory" | "injected"
+        "source": candidate.source,
     }
 
 
@@ -339,18 +312,11 @@ def _build_proposal(clinic: ClinicCandidate, arrangement: _Arrangement) -> Booki
 def _book_and_confirm(
     user: UserInput, clinic: ClinicCandidate, arrangement: _Arrangement
 ) -> AppointmentResult:
-    """Books the clinic -- giving them the patient's details, which no earlier
-    call did -- then has the interpreter confirm for real, then texts the
-    user and whoever was secured.
-
-    The booking call raises if it didn't actually book (see
-    clinic_call._require_booked), and nothing fee-bearing exists yet at that
-    point.
-
-    NOT implemented: the design's "add the appointment to the user's
-    calendar" step. No mechanism is specified for it and none is invented
-    here; see README.
-    """
+    """Books the clinic (the first call that gives it the patient's details),
+    has the interpreter confirm for real, then texts the user and whoever was
+    secured. The booking call raises if it didn't actually book, and at that
+    point nothing fee-bearing exists yet. Adding the booking to the user's
+    calendar is not implemented."""
     slot = arrangement.slot
     booking = clinic_call.book_slot(clinic, slot, user)
 
@@ -375,8 +341,7 @@ def _book_and_confirm(
                 f"{slot.date} {slot.time}."
             )
         else:
-            # Every family member declined the binding confirm; a freelance
-            # interpreter covered this one already-booked slot instead.
+            # Every family member declined; a freelancer covered the booked slot.
             interpreter_detail = {**_freelancer_detail(interpreter), "confirmed": True}
             arrangement.evidence.append(
                 f"No family member could confirm {slot.date} {slot.time}; "
@@ -406,8 +371,6 @@ def _book_and_confirm(
         interpreter=interpreter_detail,
         family_tier_result=arrangement.family_tier_result,
         interpreter_source=source,
-        cancellation_deadline=None,  # TODO: derive from the interpreter's own
-                                      # policy, once real interpreter data exists
         clinic_contact={
             "name": clinic.name, "phone": clinic.phone,
             "zipcode": clinic.zipcode, "address": clinic.address,
@@ -422,10 +385,9 @@ def _book_and_confirm(
 def _cancel_and_raise(
     user: UserInput, clinic: ClinicCandidate, slot: ClinicSlot, booking: dict, reason: str
 ) -> NoReturn:
-    """Shared by both confirm paths below: nobody confirmed, so the booking
-    that was made on the strength of an earlier non-binding "yes" has to be
-    undone. If the clinic won't cancel, the user has to be told which
-    booking to undo themselves."""
+    """Nobody confirmed, so the booking made on the strength of an earlier
+    non-binding "yes" is undone. If the clinic won't cancel, the error tells
+    the user which booking to undo themselves."""
     reference = booking.get("booking_reference")
     if clinic_call.cancel_booking(clinic, slot, user.name, reference):
         outcome = f"The booking at {clinic.name} was cancelled."
@@ -445,10 +407,9 @@ def _confirm_freelancer(
     booking: dict,
     freelancers: list[InterpreterCandidate],
 ) -> InterpreterCandidate:
-    """The one binding ask, made after the clinic is booked. The first
-    freelancer to say yes gets the engagement. If none does, the clinic
-    booking is cancelled so no appointment is left standing without an
-    interpreter."""
+    """The binding ask, after the clinic is booked. The first freelancer to say
+    yes gets the engagement; if none does, the clinic booking is cancelled so
+    no appointment is left without an interpreter."""
     for candidate in freelancers:
         if interpreter_matching.confirm_interpreter(candidate, slot, clinic, user):
             return candidate
@@ -466,26 +427,17 @@ def _confirm_family(
     booking: dict,
     arrangement: _Arrangement,
 ) -> "tuple[FamilyInterpreter | InterpreterCandidate, str]":
-    """The binding ask for a family arrangement, made after the clinic is
-    booked. A family member's "yes" during Step 3A was given to a slot that
-    wasn't booked yet, so the locked-in member is called back to confirm for
-    real. If they decline, the next unreached family member is asked the same
-    question directly -- the search stopped at the first yes, so nobody after
-    that member was ever contacted. If the whole family list declines, the
-    search falls through to freelance interpreters for this one already-
-    booked slot, exactly as it would have if no family member had matched in
-    the first place.
-
-    Returns the person who ultimately confirmed, together with "family" or
-    "freelance". Cancels the clinic booking and raises if nobody does.
-    """
+    """The binding ask for a family arrangement, after the clinic is booked.
+    The locked-in member is called back to confirm for real; if they decline,
+    the next unreached member is asked directly. If the whole list declines,
+    freelancers are searched for this one booked slot. Returns who confirmed
+    and "family" or "freelance"; cancels the clinic booking and raises if
+    nobody does."""
     for member in (arrangement.family_member, *arrangement.remaining_family):
         if family_call.confirm_family_member(member, slot, user, clinic):
             return member, "family"
 
-    # The same pool a freelance-first run would have searched -- the caller's
-    # injected candidates in a test, or the real roster in production. Never
-    # loaded eagerly: most runs never reach this fallback at all.
+    # Resolved only now: most runs never reach this fallback.
     freelance_pool = _resolve_freelance_pool(clinic, arrangement.freelance_pool)
     ranked = interpreter_matching.search_freelancers_in_batches(
         freelance_pool, [slot], clinic, batch_size=interpreter_matching.DEFAULT_BATCH_SIZE
@@ -508,11 +460,9 @@ def _send_confirmations(
     interpreter: "FamilyInterpreter | InterpreterCandidate | None",
     requirements: list[str],
 ) -> list[str]:
-    """Both confirmation texts -- or just the user's, when the user brought
-    their own interpreter and the agent has no way to reach them. No SMS
-    provider is wired up (the design names none), so each send degrades to an
-    evidence line instead of failing a run whose appointment is genuinely
-    booked."""
+    """Texts the user and the secured interpreter (just the user when they
+    brought their own). With no provider configured each send becomes an
+    evidence line instead of failing a run whose appointment is booked."""
     interpreter_name = interpreter.name if interpreter else None
     recipients = [("user", user.phone_number, "You")]
     if interpreter is not None:
@@ -542,35 +492,23 @@ def _send_confirmations(
 
 
 # --- Cancellation ------------------------------------------------------------
-#
-# Undoes an already-SUCCEEDED booking, on the user's request -- a separate
-# action from anything above, placed long after run_interpreter_mesh() has
-# returned and its local ClinicCandidate/InterpreterCandidate/FamilyInterpreter
-# objects are gone. `result` is the plain dict a succeeded run's
-# AppointmentResult serializes to (dataclasses.asdict) -- exactly what
-# api/server.py stores and what the frontend polls back -- so this works from
-# a stored record alone, with no live objects from the original run required.
 
 def cancel_appointment(result: dict, patient_name: str) -> dict:
-    """Cancels the clinic appointment, then releases whoever was lined up to
-    interpret it -- family or freelance, whichever `result["interpreter"]`
-    says was actually confirmed. Nobody is called for a user-arranged
-    interpreter: no contact details were ever collected for them, same as
-    everywhere else in this design.
+    """Cancels a booked appointment on the user's request: calls the clinic,
+    then releases whoever was confirmed to interpret (nobody is called for a
+    user-arranged interpreter).
 
-    Both the clinic cancel and the interpreter release are attempted
-    regardless of each other's outcome: an interpreter who no-shows because
-    the clinic's own system wasn't actually updated is a worse outcome than
-    a clinic that still thinks the slot is taken, so releasing them doesn't
-    wait on the clinic confirming first. A clinic that refuses to confirm
-    the cancellation is reported, not raised -- same as everywhere else, the
-    caller (and ultimately the user) needs to know to follow up directly,
-    not have the whole action fail over it."""
+    `result` is the plain dict a succeeded run's AppointmentResult serializes
+    to, so this works from a stored record alone, long after the run's objects
+    are gone. The clinic cancel and the interpreter release are both
+    attempted whatever the other's outcome, because an interpreter who
+    no-shows is worse than a clinic that still thinks the slot is taken. A
+    clinic that doesn't confirm is reported, not raised, so the user knows to
+    follow up."""
     contact = result.get("clinic_contact") or {}
     if not contact.get("phone"):
         raise RuntimeError(
-            "This booking has no clinic contact info on file -- it predates "
-            "the cancellation feature, or the record is incomplete. Call the "
+            "This booking has no clinic contact info on file. Call the "
             "clinic directly to cancel."
         )
     clinic = ClinicCandidate(

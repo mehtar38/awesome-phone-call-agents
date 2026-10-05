@@ -1,18 +1,10 @@
-/* Single-page booking flow. Plain JS, no framework/build step -- kept
-   consistent with the rest of this repo. State lives in memory for the
-   session; the profile+family portion of it is persisted server-side (see
-   db.py) so a returning user on the same browser skips straight past setup.
-
-   There is no login system anywhere in this project, so "who is this
-   browser" is a UUID generated once and kept in localStorage. That's enough
-   to make a profile persist across visits without building real auth under
-   this timeline -- it's per-browser/device identity, not an account. */
+/* Single-page booking flow in plain JS (no framework or build step). State
+   lives in memory; the profile and family are persisted server-side (db.py).
+   There is no login: the browser is identified by a UUID kept in localStorage. */
 
 // ---------------------------------------------------------------- state --
 
-// value must match signcall's AppointmentType enum (workflow/types.py)
-// exactly -- a mismatch here passes schema validation client-side but gets
-// rejected by signcall with a 400 the moment the booking is submitted.
+// Values must match signcall's AppointmentType enum (workflow/types.py).
 const CLINIC_TYPES = [
   { value: "physical_therapy", label: "Physical Therapy" },
   { value: "eyes", label: "Eyes" },
@@ -26,11 +18,8 @@ const SETUP_STEPS = ["profileMethod", "profileData", "profileVerify", "familyLis
 
 const state = {
   userId: null,
-  // Family is part of the profile now, like insurance -- collected once and
-  // persisted, not gated behind an interpreter question. Whether THIS
-  // particular visit needs an interpreter varies day to day, so that choice
-  // lives on the booking (state.booking.has_interpreter), asked fresh each
-  // time at submission -- never assumed from a past answer.
+  // Family is stored with the profile; whether a visit needs an interpreter is
+  // asked per booking (state.booking.has_interpreter).
   profile: { name: "", phone: "", age: "", dob: "", address: "", zipcode: "", insurance_name: "", insurance_id: "" },
   family: [],
   cardFiles: { id: null, insurance: null },
@@ -89,10 +78,6 @@ function hideBanner(id) {
 }
 
 function setVal(id, value) {
-  // Guards against a page/script version mismatch (e.g. an old index.html
-  // served alongside a newer app.js after only some files got replaced) --
-  // one missing field then shows up as a blank input instead of a crash
-  // that leaves the whole screen stuck.
   const el = document.getElementById(id);
   if (el) el.value = value;
   else console.warn(`setVal: no element #${id} on this page -- is index.html up to date?`);
@@ -146,9 +131,7 @@ async function init() {
     if (res.exists && res.profile && res.profile.name) {
       state.profile = { ...state.profile, ...res.profile };
       state.family = res.profile.family || [];
-      // phone/dob/insurance became required after this profile may have been
-      // saved -- if any are missing, send a returning user back to verify
-      // instead of silently failing later at booking submission.
+      // A saved profile missing a required field goes back to verify.
       const complete = state.profile.name && state.profile.phone && state.profile.dob
         && state.profile.insurance_name && state.profile.insurance_id && state.profile.zipcode;
       if (complete) {
@@ -161,7 +144,7 @@ async function init() {
       return;
     }
   } catch (e) {
-    // no saved profile yet (or server hiccup) -- fall through to setup, which is the normal first-visit path
+    // no saved profile (or the server is unreachable): fall through to setup
   }
   showScreen("profileMethod");
 }
@@ -223,7 +206,7 @@ async function onUploadContinue() {
     }
     state.profile = { ...state.profile, ...merged };
   } catch (e) {
-    showBanner("uploadError", "Couldn't read one of the cards automatically -- you can still fill in the details on the next screen.");
+    showBanner("uploadError", "Couldn't read a card. Fill in the details next.");
   } finally {
     hideLoading();
   }
@@ -264,11 +247,11 @@ function wireProfileVerify() {
     };
     if (!state.profile.name || !state.profile.zipcode || !state.profile.dob
         || !state.profile.insurance_name || !state.profile.insurance_id) {
-      showBanner("profileError", "Name, date of birth, zip code, and insurance are required.");
+      showBanner("profileError", "Fill in name, birth date, zip, insurance.");
       return;
     }
     if (!isValidUSPhone(state.profile.phone)) {
-      showBanner("profileError", "Enter a valid 10-digit phone number.");
+      showBanner("profileError", "Enter a 10-digit phone number.");
       return;
     }
     hideBanner("profileError");
@@ -321,12 +304,12 @@ function wireFamilyList() {
   document.getElementById("btnFamilyContinue").addEventListener("click", () => {
     const incomplete = state.family.some((m) => !m.name || !m.phone);
     if (incomplete) {
-      showBanner("familyError", "Add a name and phone number for each family member, or remove the row.");
+      showBanner("familyError", "Each person needs a name and phone.");
       return;
     }
     const badPhone = state.family.some((m) => !isValidUSPhone(m.phone));
     if (badPhone) {
-      showBanner("familyError", "Each family member needs a valid 10-digit phone number.");
+      showBanner("familyError", "Each phone needs 10 digits.");
       return;
     }
     hideBanner("familyError");
@@ -341,7 +324,7 @@ function renderFamilyVerify() {
     ? state.family.map((m) => `
         <div class="review-row"><span class="k">${m.relation || "Family"}</span><span class="v">${m.name} &middot; ${m.phone}</span></div>
       `).join("")
-    : `<p class="hint">No family members added. You can still add some later by editing your profile.</p>`;
+    : `<p class="hint">None added.</p>`;
 }
 
 function wireFamilyVerify() {
@@ -353,13 +336,11 @@ function wireFamilyVerify() {
 }
 
 async function persistProfile() {
-  showLoading("Saving your profile…");
+  showLoading("Saving…");
   try {
     await apiPostJson(`/profile/${state.userId}`, { ...state.profile, family: state.family });
   } catch (e) {
-    // Non-fatal for the demo flow -- the user can still complete a booking
-    // this session even if the save call failed; they'd just have to redo
-    // setup on their next visit.
+    // Non-fatal: booking still works this session; setup repeats next visit.
   } finally {
     hideLoading();
   }
@@ -387,7 +368,7 @@ function wireInputMethod() {
   document.getElementById("typedInput").addEventListener("input", updateUseButtonState);
   document.getElementById("btnEditProfile").addEventListener("click", () => showScreen("profileVerify"));
   document.getElementById("btnUseTranscript").addEventListener("click", onUseTranscript);
-  document.getElementById("btnViewHistory").addEventListener("click", openHistory);
+  document.getElementById("btnViewUpcoming").addEventListener("click", openUpcoming);
 
   wireSignCamera();
 }
@@ -407,12 +388,13 @@ async function onUseTranscript() {
   if (!text) return;
   state.transcript = text;
   if (running) stopSession();
-  showLoading("Understanding your request…");
+  showLoading("Reading your request…");
   try {
     state.parsed = await apiPostJson("/parse-booking", { transcript: text });
   } catch (e) {
+    console.warn("parse-booking failed:", e.message);  // the banner stays short; the real reason is here
     state.parsed = { availability: [], clinic_type_hint: null };
-    showBanner("bookingError", "Couldn't understand that automatically -- please fill in the details below.");
+    showBanner("bookingError", "Couldn't read that. Fill in below.");
   } finally {
     hideLoading();
   }
@@ -538,8 +520,6 @@ function fillBookingConfirm() {
     : [{ day: "", date: "", time: "" }];
   renderAvailabilityRows();
 
-  // Asked fresh every time a request is submitted -- whether they need an
-  // interpreter found varies visit to visit, so we never carry over a past answer.
   state.booking.has_interpreter = null;
   document.getElementById("bc_interpreterHave").classList.remove("selected");
   document.getElementById("bc_interpreterNeed").classList.remove("selected");
@@ -556,7 +536,7 @@ function selectBookingInterpreter(hasOwn) {
     familyReview.style.display = "block";
     familyReview.innerHTML = state.family.length
       ? state.family.map((m) => `<div class="review-row"><span class="k">${m.relation || "Family"}</span><span class="v">${m.name} &middot; ${m.phone}</span></div>`).join("")
-      : `<p class="hint">No family on file -- we'll search for a nearby interpreter instead.</p>`;
+      : "";
   } else {
     familyReview.style.display = "none";
   }
@@ -568,6 +548,19 @@ function dayNameFor(dateStr) {
   return isNaN(d) ? "Pick a date" : d.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
 }
 
+// "14:00" -> "2 PM–3 PM": the workflow books within the hour starting at the chosen time.
+function hourRange(time) {
+  const start = new Date(`2000-01-01T${time}`);
+  if (isNaN(start)) return "";
+  const end = new Date(start.getTime() + 60 * 60 * 1000);
+  const fmt = (d) => d.toLocaleTimeString(undefined, { hour: "numeric", minute: d.getMinutes() ? "2-digit" : undefined });
+  return `${fmt(start)}–${fmt(end)}`;
+}
+
+function availabilityLabel(row) {
+  return [row.day || dayNameFor(row.date), row.time && hourRange(row.time)].filter(Boolean).join(" · ");
+}
+
 function renderAvailabilityRows() {
   const container = document.getElementById("availabilityRows");
   container.innerHTML = "";
@@ -575,7 +568,7 @@ function renderAvailabilityRows() {
     const wrap = document.createElement("div");
     wrap.style.marginBottom = "10px";
     wrap.innerHTML = `
-      <div class="hint" style="margin:0 0 4px;font-weight:700;color:var(--text);" data-day-label="${i}">${row.day || dayNameFor(row.date)}</div>
+      <div class="hint" style="margin:0 0 4px;font-weight:700;color:var(--text);" data-day-label="${i}">${availabilityLabel(row)}</div>
       <div class="avail-row" style="margin-bottom:0;">
         <div class="field"><input type="date" data-field="date" data-i="${i}" value="${row.date || ""}"></div>
         <div class="field"><input type="time" data-field="time" data-i="${i}" value="${row.time || ""}"></div>
@@ -587,13 +580,11 @@ function renderAvailabilityRows() {
   container.querySelectorAll("input").forEach((inp) => {
     inp.addEventListener("input", (e) => {
       const i = Number(e.target.dataset.i);
-      state.booking.availability[i][e.target.dataset.field] = e.target.value;
-      if (e.target.dataset.field === "date") {
-        const day = dayNameFor(e.target.value);
-        state.booking.availability[i].day = day;
-        const label = container.querySelector(`[data-day-label="${i}"]`);
-        if (label) label.textContent = day;
-      }
+      const row = state.booking.availability[i];
+      row[e.target.dataset.field] = e.target.value;
+      if (e.target.dataset.field === "date") row.day = dayNameFor(e.target.value);
+      const label = container.querySelector(`[data-day-label="${i}"]`);
+      if (label) label.textContent = availabilityLabel(row);
     });
   });
   container.querySelectorAll(".remove-link").forEach((btn) => {
@@ -621,11 +612,11 @@ async function onSubmitBooking() {
   const availability = state.booking.availability.filter((a) => a.date && a.time);
 
   if (!zipcode || availability.length === 0) {
-    showBanner("bookingError", "Zip code and at least one date/time are required.");
+    showBanner("bookingError", "Add a zip and a date & time.");
     return;
   }
   if (state.booking.has_interpreter === null) {
-    showBanner("bookingError", "Please say whether you have an interpreter for this visit.");
+    showBanner("bookingError", "Choose an interpreter option.");
     return;
   }
   hideBanner("bookingError");
@@ -645,35 +636,28 @@ async function onSubmitBooking() {
     family: state.booking.has_interpreter ? [] : state.family,
   };
 
-  showLoading("Sending your request…");
+  showLoading("Sending…");
   try {
     const result = await apiPostJson("/submit-booking", payload);
     hideLoading();
     if (result && result.run_id) {
-      const clinicLabel = (CLINIC_TYPES.find((c) => c.value === clinic_type) || {}).label || clinic_type;
-      const summary = state.booking.has_interpreter
-        ? `Looking for a ${clinicLabel} appointment near ${zipcode}.`
-        : `Looking for a ${clinicLabel} appointment near ${zipcode}, plus an ASL interpreter for it.`;
-      startTracking(result.run_id, result.plan || "", null, null, summary);
+      startTracking(result.run_id);
     } else {
       showOutcome({ status: "sent" });
     }
   } catch (e) {
     hideLoading();
-    // Surface the server's actual reason (e.g. a specific bad field) instead
-    // of a generic message -- much faster to fix during testing.
-    showBanner("bookingError", e.message || "Something went wrong sending this -- please try again.");
+    // show the server's actual reason (e.g. which field was bad)
+    showBanner("bookingError", e.message || "Couldn't send. Try again.");
   }
 }
 
 // ------------------------------------------- workflow progress / approval --
 //
-// After a request is sent, the booking workflow runs for minutes and reports
-// back through the server (see app.py's /notifications). This section follows
-// one run: a progress screen while it works, a confirm screen when it needs
-// the user's go/no-go, and an outcome screen when it ends. Statuses, as the
-// server reports them: running, awaiting_confirmation, succeeded, declined,
-// failed.
+// Follows one run, which takes minutes and reports through app.py's
+// /notifications: a progress screen while it works, a confirm screen for the
+// user's go/no-go, an outcome screen at the end. Statuses: running,
+// awaiting_confirmation, succeeded, declined, failed.
 
 const POLL_INTERVAL_MS = 2000;
 const ACTIVE_RUN_KEY = "aslapp_active_run";
@@ -688,8 +672,7 @@ function el(tag, className, text) {
   return node;
 }
 
-// Everything the workflow reports (clinic names, notes taken from phone
-// calls) is untrusted text, so it is only ever set as textContent.
+// Workflow text (clinic names, call notes) is untrusted: only set as textContent.
 function fillRows(container, rows) {
   container.replaceChildren(...rows.map(([label, value]) => {
     const row = el("div", "review-row");
@@ -703,12 +686,6 @@ function fillList(box, list, items) {
   box.hidden = items.length === 0;
 }
 
-function formatWhen(date, time) {
-  const when = new Date(`${date}T${time}`);
-  if (isNaN(when)) return `${date} ${time}`;
-  return when.toLocaleString(undefined, { weekday: "long", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
-}
-
 function formatDate(date) {
   const when = new Date(`${date}T00:00`);
   return isNaN(when) ? date : when.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
@@ -719,8 +696,7 @@ function formatTime(time) {
   return isNaN(when) ? time : when.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
 }
 
-// The full picture (rate, minimum hours, estimate) -- used in "More details",
-// not the main summary line. See describeInterpreterStatus() for that.
+// Rate, minimum hours and estimate, for "More details".
 function describeInterpreter(interpreter) {
   if (!interpreter || interpreter.tier === "user_arranged") return "Your own interpreter";
   if (interpreter.tier === "family") return `${interpreter.name} (${interpreter.relation})`;
@@ -729,28 +705,20 @@ function describeInterpreter(interpreter) {
   return `${interpreter.name}: $${interpreter.rate_per_hour}/hr${minimum}${total}`;
 }
 
-// One short line for the main summary: who, and whether they're actually
-// locked in yet. `confirmed` only ever appears on a SUCCEEDED run's own
-// result -- a pre-approval proposal's interpreter never has it, so this
-// correctly reads as "found, not yet confirmed" there.
+// One short line: who interprets, plus "(confirmed)" once locked in (only a
+// succeeded result carries `confirmed`).
 function describeInterpreterStatus(interpreter) {
-  if (!interpreter || interpreter.tier === "user_arranged") return "Your own interpreter";
-  if (interpreter.tier === "family") {
-    return interpreter.confirmed ? `${interpreter.name} (${interpreter.relation}) -- confirmed` : `${interpreter.name} (${interpreter.relation})`;
-  }
-  return interpreter.confirmed ? `${interpreter.name} -- confirmed` : `${interpreter.name} -- found, confirming next`;
+  if (!interpreter || interpreter.tier === "user_arranged") return "Your own";
+  const who = interpreter.tier === "family" ? `${interpreter.name} (${interpreter.relation})` : interpreter.name;
+  return interpreter.confirmed ? `${who} (confirmed)` : who;
 }
 
 function describeClinic(name, zipcode, address) {
   return address ? `${name} -- ${address}` : `${name} (ZIP ${zipcode})`;
 }
 
-// Shows/hides a "More details" <details> box based on whether it actually
-// has anything in it -- an empty disclosure that expands to nothing is worse
-// than no disclosure at all. `idPrefix` is "confirm" or "done": both screens
-// name their requirements/notes elements <prefix>Requirements(/List) and
-// <prefix>Notes(/List), so this reads them by that convention rather than
-// taking four extra element arguments.
+// Shows "More details" only when it has content. `idPrefix` is "confirm" or
+// "done"; the elements are named <prefix>Requirements(/List) and <prefix>Notes(/List).
 function setMoreDetails(idPrefix, rows, requirements, notes) {
   const detailsEl = document.getElementById(`${idPrefix}More`);
   fillRows(document.getElementById(`${idPrefix}MoreDetails`), rows);
@@ -767,16 +735,13 @@ function setMoreDetails(idPrefix, rows, requirements, notes) {
   detailsEl.hidden = rows.length === 0 && !(requirements || []).length && !(notes || []).length;
 }
 
-function startTracking(runId, plan, progressTitle, progressText, summary) {
+function startTracking(runId, progressTitle, progressText) {
   stopTracking();
   Object.assign(tracking, { id: runId, failures: 0, screen: null, answered: false, declinedByUser: false });
-  try { localStorage.setItem(ACTIVE_RUN_KEY, runId); } catch (e) { /* private mode: tracking just won't survive a refresh */ }
-  document.getElementById("progressSummaryText").textContent = summary || "";
-  document.getElementById("progressPlanText").textContent = plan;
-  document.getElementById("progressMore").hidden = !plan;
+  try { localStorage.setItem(ACTIVE_RUN_KEY, runId); } catch (e) { /* private mode: tracking won't survive a refresh */ }
   showProgress(
-    progressTitle || "Finding your appointment",
-    progressText || "Calling clinics and interpreters. This can take a few minutes. Keep this page open -- we'll ask you before anything is booked.",
+    progressTitle || "Finding appointment",
+    progressText || "This can take a few minutes. Keep this page open.",
   );
   pollBooking();
   tracking.timer = setInterval(pollBooking, POLL_INTERVAL_MS);
@@ -806,7 +771,7 @@ async function pollBooking() {
   } catch (e) {
     tracking.failures += 1;
     if (tracking.failures >= 3 && tracking.screen === "progress") {
-      document.getElementById("progressText").textContent = "Having trouble reaching the server. Still trying...";
+      document.getElementById("progressText").textContent = "Reconnecting…";
     }
     return;
   }
@@ -814,10 +779,10 @@ async function pollBooking() {
   tracking.failures = 0;
 
   if (booking.status === "awaiting_confirmation") {
-    // Once answered, ignore a stale poll that still says "awaiting".
+    // after answering, ignore a stale poll that still says "awaiting"
     if (!tracking.answered && tracking.screen !== "confirm") showConfirm(booking.proposal);
   } else if (booking.status === "running" || booking.status === "cancelling") {
-    // Still in progress -- keep polling, the progress screen is already showing.
+    // still in progress: keep polling
   } else {
     forgetRun();
     showOutcome(booking);
@@ -851,7 +816,7 @@ function showConfirm(proposal) {
   }
   if (proposal.clinic_distance_miles != null) moreRows.push(["Distance", `${proposal.clinic_distance_miles} mi away`]);
   if (proposal.alternates && proposal.alternates.length) {
-    moreRows.push(["If they decline", proposal.alternates.map(describeInterpreter).join("; ")]);
+    moreRows.push(["Backups", proposal.alternates.map(describeInterpreter).join("; ")]);
   }
 
   fillRows(document.getElementById("confirmDetails"), rows);
@@ -874,12 +839,12 @@ async function answerProposal(approved) {
   } catch (e) {
     tracking.answered = false;
     tracking.declinedByUser = false;
-    showBanner("confirmError", e.message || "Couldn't send your answer -- please try again.");
+    showBanner("confirmError", e.message || "Couldn't send. Try again.");
     setConfirmButtons(true);
     return;
   }
   if (approved) {
-    showProgress("Booking your appointment", "Calling the clinic to book, then confirming your interpreter.");
+    showProgress("Booking…", "This can take a minute.");
   } else {
     pollBooking();
   }
@@ -890,10 +855,9 @@ let doneBookingId = null;
 function showOutcome(booking) {
   document.title = APP_TITLE;
   doneBookingId = booking.run_id;
-  const proposal = booking.proposal;
   const result = booking.result;
   let title = "Request sent";
-  let sub = "We'll text you once it's confirmed.";
+  let sub = "";
   let kind = "ok";
   let rows = [];
   let moreRows = [];
@@ -901,8 +865,7 @@ function showOutcome(booking) {
   if (booking.status === "succeeded") {
     const contact = (result && result.clinic_contact) || {};
     const slot = (result && result.appointment_slot) || {};
-    title = "Appointment booked";
-    sub = `${contact.name || "Your clinic"}, ${formatWhen(slot.date, slot.time)}`;
+    title = "Booked";
     rows = [
       ["Date", formatDate(slot.date)],
       ["Time", formatTime(slot.time)],
@@ -916,32 +879,28 @@ function showOutcome(booking) {
       moreRows.push(["Interpreter rate", describeInterpreter(result.interpreter)]);
     }
   } else if (booking.status === "declined") {
-    title = "Nothing was booked";
-    sub = tracking.declinedByUser
-      ? "You chose not to book this appointment."
-      : (booking.reason || "This request was not approved.");
+    title = "Nothing booked";
+    sub = tracking.declinedByUser ? "" : (booking.reason || "Not approved.");
     kind = "stop";
   } else if (booking.status === "failed") {
-    title = "We couldn't finish this";
-    sub = booking.error || "Something went wrong while booking.";
+    title = "Couldn't finish";
+    sub = booking.error || "Something went wrong.";
     kind = "stop";
   } else if (booking.status === "cancelled") {
-    title = "Appointment cancelled";
-    sub = proposal ? `${proposal.clinic_name}, ${formatWhen(proposal.date, proposal.time)}` : "Your appointment has been cancelled.";
+    title = "Cancelled";
     const cancellation = booking.cancellation || {};
-    rows.push(["Clinic", cancellation.clinic_cancelled
-      ? "Confirmed the cancellation"
-      : "Did NOT confirm the cancellation -- call them directly to make sure"]);
-    if (cancellation.interpreter_released === true) rows.push(["Interpreter", "Called and told the engagement is cancelled"]);
-    else if (cancellation.interpreter_released === false) rows.push(["Interpreter", "Nobody to notify"]);
+    rows.push(["Clinic", cancellation.clinic_cancelled ? "Cancelled" : "Not confirmed. Call them."]);
+    if (cancellation.interpreter_released === true) rows.push(["Interpreter", "Told"]);
   } else if (booking.status === "cancel_failed") {
     title = "Couldn't cancel";
-    sub = booking.error || "Something went wrong while cancelling -- your appointment is still booked.";
+    sub = booking.error || "Still booked.";
     kind = "stop";
   }
 
   document.getElementById("doneTitle").textContent = title;
-  document.getElementById("doneSub").textContent = sub;
+  const subEl = document.getElementById("doneSub");
+  subEl.textContent = sub;
+  subEl.hidden = !sub;
   document.getElementById("doneIcon").dataset.kind = kind;
   fillRows(document.getElementById("doneDetails"), rows);
   setMoreDetails("done", moreRows, (result && result.requirements) || [], (result && result.notes) || []);
@@ -950,16 +909,15 @@ function showOutcome(booking) {
   const canCancel = booking.status === "succeeded" || booking.status === "cancel_failed";
   btnCancel.hidden = !canCancel;
   btnCancel.disabled = false;
-  btnCancel.textContent = booking.status === "cancel_failed" ? "Try cancelling again" : "Cancel appointment";
+  btnCancel.textContent = booking.status === "cancel_failed" ? "Try again" : "Cancel appointment";
   tracking.screen = "done";
   showScreen("done");
 }
 
-const CANCELLING_TITLE = "Cancelling your appointment";
-const CANCELLING_TEXT = "Calling the clinic, then your interpreter, to let them know. This can take a minute or two.";
+const CANCELLING_TITLE = "Cancelling…";
+const CANCELLING_TEXT = "This can take a minute.";
 
-// A refresh mid-run shouldn't lose the request: pick it back up, or show how
-// it ended while the page was closed. Returns whether it took over the screen.
+// Resumes a run after a refresh, or shows how it ended. Returns whether it took over the screen.
 async function resumeActiveRun() {
   let runId = null;
   try { runId = localStorage.getItem(ACTIVE_RUN_KEY); } catch (e) { /* storage unavailable */ }
@@ -967,9 +925,9 @@ async function resumeActiveRun() {
   try {
     const booking = await fetchBooking(runId);
     if (booking.status === "cancelling") {
-      startTracking(runId, "", CANCELLING_TITLE, CANCELLING_TEXT);
+      startTracking(runId, CANCELLING_TITLE, CANCELLING_TEXT);
     } else if (booking.status === "running" || booking.status === "awaiting_confirmation") {
-      startTracking(runId, "");
+      startTracking(runId);
     } else {
       forgetRun();
       showOutcome(booking);
@@ -990,10 +948,7 @@ function wireConfirm() {
 
 async function onCancelAppointment() {
   if (!doneBookingId) return;
-  const confirmed = window.confirm(
-    "Cancel this appointment? We'll call the clinic to cancel, and call your interpreter(only if we found and called one for you) to let them know it's off.",
-  );
-  if (!confirmed) return;
+  if (!window.confirm("Cancel this appointment?")) return;
 
   hideBanner("cancelError");
   const btn = document.getElementById("btnCancelAppointment");
@@ -1003,10 +958,10 @@ async function onCancelAppointment() {
     await apiPostJson(`/bookings/${encodeURIComponent(runId)}/cancel`, { user_id: state.userId });
   } catch (e) {
     btn.disabled = false;
-    showBanner("cancelError", e.message || "Couldn't cancel -- please try again.");
+    showBanner("cancelError", e.message || "Couldn't cancel. Try again.");
     return;
   }
-  startTracking(runId, "", CANCELLING_TITLE, CANCELLING_TEXT);
+  startTracking(runId, CANCELLING_TITLE, CANCELLING_TEXT);
 }
 
 function wireDone() {
@@ -1021,98 +976,61 @@ function wireDone() {
   document.getElementById("btnCancelAppointment").addEventListener("click", onCancelAppointment);
 }
 
-// ----------------------------------------------------------- history --
+// ---------------------------------------------------------- upcoming --
 //
-// Every booking this browser has ever submitted, most recent first -- how a
-// booking from days ago gets found and cancelled again, since by then
-// state.tracking's own localStorage pointer (see ACTIVE_RUN_KEY above) has
-// long since moved on to whatever was booked most recently, or been cleared
-// entirely. This list is read once when the screen opens; it does not poll.
+// Booked future appointments, soonest first, read once when the screen opens.
+// This is how an older booking is found and cancelled.
 
-function statusLabel(status) {
-  return ({
-    running: "In progress", awaiting_confirmation: "Waiting on your answer",
-    succeeded: "Booked", declined: "Not booked", failed: "Couldn't finish",
-    cancelling: "Cancelling…", cancelled: "Cancelled", cancel_failed: "Couldn't cancel",
-  })[status] || status;
-}
-
-function describeBookingWhen(booking) {
-  const slot = booking.proposal || (booking.result && booking.result.appointment_slot);
-  return slot ? formatWhen(slot.date, slot.time) : null;
-}
-
-function describeBookingWhere(booking) {
-  if (booking.proposal) return booking.proposal.clinic_name;
-  const contact = booking.result && booking.result.clinic_contact;
-  return contact ? contact.name : "Appointment request";
-}
-
-async function openHistory() {
-  hideBanner("historyError");
-  document.getElementById("historyList").innerHTML = "";
-  document.getElementById("historyEmpty").hidden = true;
-  showScreen("history");
+async function openUpcoming() {
+  hideBanner("upcomingError");
+  document.getElementById("upcomingList").innerHTML = "";
+  document.getElementById("upcomingEmpty").hidden = true;
+  showScreen("upcoming");
   try {
-    const { bookings } = await apiGet(`/bookings?user_id=${encodeURIComponent(state.userId)}`);
-    renderHistory(bookings);
+    const { appointments } = await apiGet(`/appointments/upcoming?user_id=${encodeURIComponent(state.userId)}`);
+    renderUpcoming(appointments);
   } catch (e) {
-    showBanner("historyError", e.message || "Couldn't load your bookings -- please try again.");
+    showBanner("upcomingError", e.message || "Couldn't load. Try again.");
   }
 }
 
-function renderHistory(bookings) {
-  const container = document.getElementById("historyList");
-  document.getElementById("historyEmpty").hidden = bookings.length > 0;
-  container.replaceChildren(
-    ...bookings.map((booking) => {
+function renderUpcoming(appointments) {
+  document.getElementById("upcomingEmpty").hidden = appointments.length > 0;
+  document.getElementById("upcomingList").replaceChildren(
+    ...appointments.map((appt) => {
       const card = el("div", "family-card");
-      const head = el("div", "family-card-head");
-      head.append(el("span", "", describeBookingWhere(booking)), el("span", "", statusLabel(booking.status)));
-      card.append(head);
+      card.append(el("div", "family-card-head", `${formatDate(appt.date)} · ${formatTime(appt.time)}`));
+      card.append(el("div", "", appt.clinic || ""));
+      card.append(el("div", "hint", appt.address || (appt.zipcode ? `ZIP ${appt.zipcode}` : "")));
+      card.append(el("div", "hint", `Interpreter: ${describeInterpreterStatus(appt.interpreter)}`));
 
-      const when = describeBookingWhen(booking);
-      if (when) card.append(el("div", "hint", when));
-      if (booking.result && booking.result.interpreter) {
-        card.append(el("div", "hint", `Interpreter: ${describeInterpreter(booking.result.interpreter)}`));
-      }
-      if (booking.status === "failed" && booking.error) card.append(el("div", "hint", booking.error));
-      if (booking.status === "declined" && booking.reason) card.append(el("div", "hint", booking.reason));
-      if (booking.status === "cancel_failed" && booking.error) card.append(el("div", "hint", booking.error));
-
-      if (booking.status === "succeeded" || booking.status === "cancel_failed") {
-        const btn = el("button", "btn btn-danger", booking.status === "cancel_failed" ? "Try cancelling again" : "Cancel");
-        btn.style.marginTop = "8px";
-        btn.addEventListener("click", () => onCancelFromHistory(booking.run_id, btn));
-        card.append(btn);
-      }
+      const btn = el("button", "btn btn-danger", "Cancel");
+      btn.style.marginTop = "8px";
+      btn.addEventListener("click", () => onCancelFromUpcoming(appt.run_id, btn));
+      card.append(btn);
       return card;
     }),
   );
 }
 
-async function onCancelFromHistory(runId, button) {
-  const confirmed = window.confirm(
-    "Cancel this appointment? We'll call the clinic to cancel, and call your interpreter (only if one was found and confirmed) to let them know it's off.",
-  );
-  if (!confirmed) return;
+async function onCancelFromUpcoming(runId, button) {
+  if (!window.confirm("Cancel this appointment?")) return;
 
-  hideBanner("historyError");
+  hideBanner("upcomingError");
   button.disabled = true;
   try {
     await apiPostJson(`/bookings/${encodeURIComponent(runId)}/cancel`, { user_id: state.userId });
   } catch (e) {
     button.disabled = false;
-    showBanner("historyError", e.message || "Couldn't cancel -- please try again.");
+    showBanner("upcomingError", e.message || "Couldn't cancel. Try again.");
     return;
   }
-  // Same progress/outcome flow the "done" screen's cancel uses -- leaves the
-  // history list and tracks this one run until the cancellation resolves.
-  startTracking(runId, "", CANCELLING_TITLE, CANCELLING_TEXT);
+  // same flow as the "done" screen's cancel
+  startTracking(runId, CANCELLING_TITLE, CANCELLING_TEXT);
 }
 
-function wireHistory() {
-  document.getElementById("btnHistoryBack").addEventListener("click", () => showScreen("inputMethod"));
+function wireUpcoming() {
+  document.getElementById("btnUpcomingBack").addEventListener("click", () => showScreen("inputMethod"));
 }
 
 // --------------------------------------------------------------- wire-up --
@@ -1127,7 +1045,7 @@ function wireUpAll() {
   wireBookingConfirm();
   wireConfirm();
   wireDone();
-  wireHistory();
+  wireUpcoming();
 }
 
 init();

@@ -1,49 +1,32 @@
 """
-Finding clinics to call. No CALL-E dependency -- this is pure lookup.
+Finding clinics to call. Pure lookup, no CALL-E dependency.
 
-The user gives a ZIP and an appointment type; this module turns that into up
-to 10 nearby clinics, nearest first, for clinic_call.search_clinics() to call
-one at a time. Each clinic is four required fields -- name, type, phone,
-zipcode -- plus an optional street address when the source actually has one,
-all defined by schemas/clinic_record.schema.json and validated against it
-before anything downstream sees it.
+Turns a ZIP and an appointment type into up to 10 nearby clinics, nearest
+first, for clinic_call.search_clinics() to phone. Each clinic is the record
+defined by schemas/clinic_record.schema.json (name, type, phone, zipcode, plus
+an optional street address) and is validated against it before anything
+downstream sees it.
 
-Mechanism: Apify's Google Maps Scraper (actor compass/crawler-google-places).
-It returns the Maps listing itself, so name, category, phone and postal code
-arrive as structured fields rather than being scraped out of page markup.
-That replaced a Google Custom Search implementation which had to guess all
-four out of `pagemap` blobs and snippet text, and had to skip directory
-aggregators by hostname to avoid pairing one business's name with another's
-phone number. None of that guesswork exists anymore.
+Source: Apify's Google Maps Scraper (actor compass/crawler-google-places),
+which returns the Maps listing itself, so every field of a clinic comes from
+that one listing.
 
-What is still true, and worth knowing:
+Things to know:
 
   - Yield is not guaranteed. A place is dropped when it has no callable US
-    number, no 5-digit ZIP, is closed, is outside the US, duplicates a phone
-    number already seen, or its category doesn't plausibly match what was
-    searched for. 20 places are requested to fill a list of 10.
-  - Apify meters per place scraped, and a run takes tens of seconds. This is
-    a synchronous call -- the workflow waits on it.
-  - Distance is computed here from ZIP centroids, not from Maps' own
-    ordering, so clinics sharing the user's ZIP all score 0.0 and a ZIP
-    outside the covered-states centroid table (see user_input.COVERED_STATES)
-    sorts last.
-  - `type` is the listing's own category. Only when Maps returns none does it
-    fall back to the label that was searched for, which is the one case where
-    it asserts nothing about the clinic.
-  - No synthetic fallback: a missing token, an Apify failure, or zero places
-    surviving the filters all come back as an empty list, not fabricated
-    clinics. An earlier version degraded to a committed synthetic dataset
-    (data/clinics_fallback.json) "to keep a demo alive" -- removed because a
-    fake clinic that LOOKS like a real, callable result is worse than an
-    honest failure: appointment.py already raises a clear "no clinic could be
-    found" error on an empty list, which is what a real search failure should
-    do instead of silently booking nothing against a clinic that doesn't
-    exist.
+    number, no 5-digit ZIP, is closed, is outside the US, repeats a phone
+    number already seen, or its category doesn't plausibly match the search.
+    20 places are requested to fill a list of 10.
+  - Apify bills per place scraped, and a run takes tens of seconds. The call
+    is synchronous.
+  - Distance comes from ZIP centroids, not Maps' own ordering, so clinics in
+    the user's ZIP all score 0.0 and a ZIP outside the covered states sorts last.
+  - There is no synthetic fallback. A missing token, an Apify failure, or zero
+    surviving places all return an empty list, and the workflow reports that
+    no clinic could be found rather than inventing one.
 """
 
 from __future__ import annotations
-
 
 import json
 import math
@@ -57,19 +40,18 @@ from .types import AppointmentType, ClinicCandidate, distance_sort_key
 from .user_input import zip_centroids, zip_state
 
 APIFY_BASE = "https://api.apify.com/v2"
-APIFY_ACTOR = "compass~crawler-google-places"  # tilde-encoded "compass/crawler-google-places"
+APIFY_ACTOR = "compass~crawler-google-places"  # "compass/crawler-google-places", tilde-encoded
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DEFAULT_DUMP_PATH = DATA_DIR / "clinics_last_search.json"
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "clinic_record.schema.json"
 
-MAX_PLACES_REQUESTED = 20   # headroom over the 10-clinic cap -- filtering is lossy
+MAX_PLACES_REQUESTED = 20   # headroom over the 10-clinic cap, since filtering is lossy
 POLL_INTERVAL_SECONDS = 3.0
 RUN_DEADLINE_SECONDS = 240.0
 HTTP_TIMEOUT_SECONDS = 60.0
 
-# Apify run statuses. Hyphens, not underscores -- and only SUCCEEDED is worth
-# fetching a dataset for.
+# Apify run statuses use hyphens, and only SUCCEEDED has a dataset worth fetching.
 RUN_SUCCEEDED = "SUCCEEDED"
 RUN_TERMINAL = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
 
@@ -83,13 +65,11 @@ SEARCH_PHRASES = {
     AppointmentType.GENERAL: "primary care clinic",
 }
 
-# Keywords that make a Maps category plausibly the thing that was searched
-# for. Google Maps returns adjacent and sponsored businesses -- an
-# "optometrist" search surfaces sunglasses shops, an "ENT doctor" search
-# surfaces med-spas. Nothing downstream reads the clinic's category (the
-# CALL-E task text is built from the USER's requested appointment type), so
-# without this filter an off-category business would be phoned with a "book a
-# dental appointment" script.
+# Keywords that make a Maps category plausibly the thing searched for. Maps
+# returns adjacent and sponsored businesses (an "optometrist" search surfaces
+# sunglasses shops), and the call script is built from the user's requested
+# type, so without this an off-category business would be phoned with the wrong
+# script.
 CATEGORY_KEYWORDS = {
     AppointmentType.PHYSICAL_THERAPY: ("physical therap", "physiotherap", "rehabilitation", "sports medicine"),
     AppointmentType.EYES: ("optometrist", "ophthalmolog", "eye care", "eye doctor", "optician", "vision"),
@@ -102,8 +82,8 @@ CATEGORY_KEYWORDS = {
 }
 
 _ZIP_RE = re.compile(r"(\d{5})")
-# Anchored on purpose: an unanchored search over "+44 20 7946 0958" happily
-# returns "+12079460958", a live US number belonging to an unrelated party.
+# Anchored on purpose: an unanchored search over "+44 20 7946 0958" would match
+# "2079460958" and return a live US number belonging to an unrelated party.
 _US_PHONE_RE = re.compile(r"^(?:\+?1)?([2-9][0-9]{2})([2-9][0-9]{2})([0-9]{4})$")
 
 _schema_cache: dict | None = None
@@ -120,8 +100,7 @@ def _schema() -> dict:
 
 def validate_record(record: dict) -> bool:
     """True when `record` conforms to schemas/clinic_record.schema.json. A
-    record that doesn't is dropped by the caller and noted -- one odd postal
-    code must never kill an entire lookup."""
+    record that doesn't is dropped; one odd listing must not fail a lookup."""
     try:
         import jsonschema
 
@@ -157,10 +136,9 @@ def candidate_to_record(clinic: ClinicCandidate) -> dict:
 # --- extraction ----------------------------------------------------------
 
 def normalize_phone(raw: str) -> str | None:
-    """US 10-digit -> E.164, or None. Deliberately anchored to the WHOLE
-    string once punctuation is stripped: a substring match would manufacture
-    a plausible US number out of an international one and hand it to the
-    dialler."""
+    """A US 10-digit number to E.164, or None. Matches the whole string once
+    punctuation is stripped, so an international number is never mangled into
+    a US one."""
     if not isinstance(raw, str):
         return None
     digits = re.sub(r"[\s().\-‐-―]", "", raw.strip())
@@ -171,9 +149,8 @@ def normalize_phone(raw: str) -> str | None:
 
 
 def extract_zip(raw: str) -> str | None:
-    """First 5-digit run, by match rather than a [:5] slice -- slicing turns
-    a Canadian 'V6B 1A1' into 'V6B 1', and any malformed value into a
-    plausible-looking wrong ZIP that then misplaces a real clinic on the map."""
+    """The leading 5-digit run, by match rather than slicing, so a Canadian
+    'V6B 1A1' yields None instead of a plausible wrong ZIP."""
     if not isinstance(raw, str):
         return None
     match = _ZIP_RE.match(raw.strip())
@@ -186,33 +163,31 @@ def category_matches(category: str, appointment_type: AppointmentType) -> bool:
 
 
 def place_to_record(place: dict, appointment_type: AppointmentType) -> dict | None:
-    """One Apify Google Maps dataset item -> a four-field clinic record, or
-    None when the place isn't usable. Every field comes from THIS place; none
-    is ever borrowed from another."""
+    """One Apify Google Maps item to a clinic record, or None when the place
+    isn't usable. Every field comes from this one place."""
     if not isinstance(place, dict):
         return None
     if place.get("permanentlyClosed") or place.get("temporarilyClosed"):
-        return None  # can't book at a closed clinic
+        return None
     country = place.get("countryCode")
     if country and str(country).upper() != "US":
-        return None  # this build dials US numbers only
+        return None
 
     phone = normalize_phone(place.get("phoneUnformatted") or "") or normalize_phone(place.get("phone") or "")
     if phone is None:
-        return None  # can't call a clinic with no number
+        return None
 
     zipcode = extract_zip(place.get("postalCode") or "")
     if zipcode is None:
-        return None  # can't rank a clinic we can't place
+        return None
 
     category = place.get("categoryName")
     if not category:
         categories = place.get("categories")
         category = categories[0] if isinstance(categories, list) and categories else None
     if category and not category_matches(str(category), appointment_type):
-        return None  # adjacent/sponsored business, not what was asked for
-    # No category at all: fall back to the searched label. This is the one
-    # case where `type` asserts nothing about the listing.
+        return None
+    # With no category at all, `type` falls back to the searched label.
     clinic_type = str(category) if category else SEARCH_PHRASES[appointment_type]
 
     name = (place.get("title") or "").strip()
@@ -220,9 +195,6 @@ def place_to_record(place: dict, appointment_type: AppointmentType) -> dict | No
         return None
 
     record = {"name": name, "type": clinic_type, "phone": phone, "zipcode": zipcode}
-    # Optional: the listing's own street address, when Maps returned one --
-    # unlike the four fields above, nothing downstream depends on this being
-    # present, so a missing or blank value is left out rather than guessed at.
     address = (place.get("address") or "").strip()
     if address:
         record["address"] = address
@@ -230,10 +202,9 @@ def place_to_record(place: dict, appointment_type: AppointmentType) -> dict | No
 
 
 def places_to_records(places: list, appointment_type: AppointmentType) -> list[dict]:
-    """Maps items -> validated records, de-duplicated by phone. Multi-location
-    practices share one central number, and calle.run.resolve_dial_target() is
-    sticky per phone -- duplicates in one batch would collapse onto a single
-    demo test line and break the per-recipient line assignment."""
+    """Maps items to validated records, de-duplicated by phone. Multi-location
+    practices share one central number, and real-mode line routing is sticky
+    per phone, so duplicates in one list would collapse onto a single line."""
     records: list[dict] = []
     seen_phones: set[str] = set()
     for place in places or []:
@@ -257,8 +228,8 @@ def haversine_miles(a: "tuple[float, float]", b: "tuple[float, float]") -> float
 
 
 def zip_distance_miles(zip_a: str, zip_b: str) -> float | None:
-    """None when either ZIP is outside the covered-states centroid table --
-    callers sort those last via types.distance_sort_key rather than guessing."""
+    """Miles between two ZIP centroids, or None if either is outside the
+    covered states (callers sort those last rather than guess)."""
     centroids = zip_centroids()
     first, second = centroids.get(zip_a), centroids.get(zip_b)
     if not first or not second:
@@ -269,15 +240,10 @@ def zip_distance_miles(zip_a: str, zip_b: str) -> float | None:
 # --- Apify transport -----------------------------------------------------
 
 def _actor_input(zipcode: str, appointment_type: AppointmentType) -> dict:
-    # The actor geocodes locationQuery to a polygon before crawling and
-    # errors the run outright when it can't resolve one; a bare 5-digit ZIP
-    # is a known weak case, so the state is spelled out too -- resolved from
-    # the ZIP itself (see zip_state()), NOT hardcoded. A hardcoded "NV" here
-    # was a real, found bug: it silently broke every non-Nevada ZIP, which
-    # is a nonsense location Apify can't geocode, returns zero places for,
-    # and which find_clinics() then (correctly, given that empty result)
-    # fell back from to the NV-only synthetic dataset -- regardless of which
-    # state the user actually typed.
+    # The actor geocodes locationQuery before crawling and cannot place a bare
+    # ZIP reliably, so the state is spelled out. It is resolved from the ZIP,
+    # never hardcoded: a wrong state yields a location that doesn't exist and
+    # an empty result.
     state = zip_state(zipcode)
     location = f"{zipcode}, {state}, United States" if state else f"{zipcode}, United States"
     return {
@@ -290,21 +256,19 @@ def _actor_input(zipcode: str, appointment_type: AppointmentType) -> dict:
 
 
 def fetch_places(zipcode: str, appointment_type: AppointmentType, token: str) -> list:
-    """Start the actor, poll it to a terminal status, return its dataset
-    items. Raises on any failure; find_clinics() is what decides that a
-    failure means "fall back", so nothing here escapes to the workflow."""
+    """Start the actor, poll it to a terminal status, and return its dataset
+    items. Raises on any failure; find_clinics() decides what that means."""
     import httpx
 
-    headers = {"Authorization": f"Bearer {token}"}  # not ?token=, so it can't
-                                                     # land in a log line or an
-                                                     # exception string
+    # Bearer header, not ?token=, so the token can't land in a log line.
+    headers = {"Authorization": f"Bearer {token}"}
     with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS, headers=headers) as client:
         started = client.post(
             f"{APIFY_BASE}/acts/{APIFY_ACTOR}/runs",
             json=_actor_input(zipcode, appointment_type),
         )
         started.raise_for_status()
-        run = started.json()["data"]  # run endpoints wrap in {"data": ...}
+        run = started.json()["data"]
         run_id, dataset_id = run["id"], run["defaultDatasetId"]
 
         deadline = time.monotonic() + RUN_DEADLINE_SECONDS
@@ -318,20 +282,19 @@ def fetch_places(zipcode: str, appointment_type: AppointmentType, token: str) ->
             status = str(polled.json()["data"].get("status", ""))
 
         if status != RUN_SUCCEEDED:
-            print("Apify status: {status}")
             raise RuntimeError(f"Apify run {run_id} finished {status}")
 
         items = client.get(f"{APIFY_BASE}/datasets/{dataset_id}/items", params={"clean": "true"})
         items.raise_for_status()
-        return items.json()  
+        return items.json()
 
 
-# --- dump -----------------------------------------------------------------
+# --- inspection dump -----------------------------------------------------
 
 def _dump(path, zipcode: str, appointment_type: AppointmentType, source: str, records: list[dict]) -> None:
-    """Inspection side-file. Written atomically so a partial write can't leave
-    invalid JSON behind, and wrapped so it can never break a lookup. Holds real
-    business names and numbers, which is why it's gitignored."""
+    """Writes the most recent search to a side file for debugging. Atomic, and
+    never allowed to break a lookup. It holds real business names and numbers,
+    which is why it is gitignored."""
     payload = {
         "searched_zipcode": zipcode,
         "appointment_type": appointment_type.value,
@@ -346,7 +309,7 @@ def _dump(path, zipcode: str, appointment_type: AppointmentType, source: str, re
         temp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
         temp.replace(path)
     except OSError:
-        pass  # inspection only -- never fail a search over it
+        pass
 
 
 # --- search --------------------------------------------------------------
@@ -357,16 +320,10 @@ def find_clinics(
     limit: int = 10,
     dump_path=DEFAULT_DUMP_PATH,
 ) -> list[ClinicCandidate]:
-    """Up to `limit` clinics, nearest first. Returns whatever qualifies --
-    fewer than `limit` is an ordinary outcome, and so is an empty list.
-
-    Every failure mode (missing token, auth error, 402 usage limit, 429, a
-    FAILED/ABORTED/TIMED-OUT run, the poll deadline, an unresolvable location,
-    or zero places surviving the filters) comes back as an empty list.
-    Nothing is fabricated to paper over it: appointment.py's caller raises a
-    clear "no clinic could be found" error on an empty list, which is the
-    honest outcome of a real search turning up nothing -- not a fake clinic
-    that looks like a real, callable result."""
+    """Up to `limit` clinics, nearest first. Fewer than `limit`, or none, is an
+    ordinary outcome: any failure (no token, auth error, usage limit, a failed
+    or timed-out run, zero places surviving the filters) returns an empty list
+    rather than anything fabricated."""
     token = os.environ.get("APIFY_API_TOKEN")
     records: list[dict] = []
     if token:
@@ -381,9 +338,7 @@ def find_clinics(
     clinics.sort(key=lambda c: distance_sort_key(c.distance_miles))
     clinics = clinics[:limit]
 
-    # Dumped AFTER sorting and capping, so the inspection file is exactly what
-    # the workflow went on to call -- not a longer list of everything the
-    # search happened to turn up.
+    # Dumped after sorting and capping, so the file is exactly what gets called.
     if dump_path is not None:
         _dump(dump_path, zipcode, appointment_type, "apify_google_maps", [candidate_to_record(c) for c in clinics])
     return clinics

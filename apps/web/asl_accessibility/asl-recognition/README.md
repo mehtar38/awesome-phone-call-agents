@@ -1,175 +1,119 @@
-# ASL-to-Text model
+# asl-recognition
 
-First component of the CALL-E hackathon accessibility submission: converts ASL
-video into English text (a limited domain vocabulary), so a deaf/HoH caller
-can drive the appointment-booking workflow. This repo covers *only* the
-ASL-to-text piece -- not the interpreter matching / calendar / call workflow.
+The web app for the ASL accessibility project. A Deaf or hard-of-hearing person sets up a profile once, then signs (camera) or types a short request such as "dentist Tuesday 3". The app turns it into a structured booking request, sends it to the [`signcall`](../signcall/README.md) workflow server, and shows progress, the approval screen and the outcome.
 
-## Why this approach
+Start with the [project README](../README.md) for the big picture, all environment variables and the safety design. This file covers this app: how to run it, what is inside, and, in detail, **what the sign-recognition model can and cannot do**.
 
-The dataset ([`akasheroor/American-Sign-Language-Dataset`](https://huggingface.co/datasets/akasheroor/American-Sign-Language-Dataset))
-is 108,618 isolated word/fingerspelling clips across 2,208 words -- not
-continuous sentence signing, and not remotely feasible to fully download (it's
-~54GB) or train on in a 2-day window. So:
-
-- **Domain-subset vocabulary, not the full 2,208 words.** `vocab.py` has a
-  candidate list (~90 words: alphabet, numbers, days, months, time words, and
-  appointment-booking domain words) built for what the call workflow actually
-  needs. It has NOT been verified against the live dataset yet -- run
-  `check_vocab_coverage.py` first.
-- **Selective download, not the full dataset.** `download_subset.py` only
-  pulls videos for words in `vocab.py`, capped at `MAX_PER_WORD` clips each.
-  Rough budget at the defaults: ~90 words x 15 clips x ~5MB =~ 6-7GB.
-- **Landmark-based model, not raw video.** MediaPipe (HandLandmarker +
-  PoseLandmarker) extracts hand+pose landmark coordinates per frame; the model
-  classifies from that ~225-dim sequence rather than raw pixels. This is
-  standard practice for isolated sign recognition (see WLASL/MS-ASL
-  literature) and trains far faster, on far less data, than a video CNN --
-  important given the per-class sample counts here are small either way.
-
-## Setup
-
-**This was built and tested in a sandbox with no internet access to
-huggingface.co, so the download/training steps could NOT be run against the
-real dataset here** -- only against synthetic data (see "What's been tested"
-below). Run everything below in Colab or on a machine with normal internet
-access.
+## Run it
 
 ```bash
-pip install -r requirements.txt
+cd apps/web/asl_accessibility
+python3 -m venv .venv && source .venv/bin/activate     # Windows PowerShell: .venv\Scripts\Activate.ps1
+pip install -r asl-recognition/requirements.txt
+
+cd asl-recognition
+cp .env.example .env          # then fill in GEMINI_API_KEY
+python3 -m uvicorn app:app --host 127.0.0.1 --port 8000
 ```
 
-Or open `colab_ASL_to_Text_Training.ipynb` in Colab and run cells top to
-bottom -- it's the same steps, with a GPU and no local setup needed.
+Open <http://localhost:8000>. Run it from this folder: the checkpoint, label map and `static/` paths are relative. The browser only grants camera access on `localhost` or HTTPS.
 
-## Pipeline
+The booking itself needs the workflow server from [`../signcall`](../signcall/README.md) on port 8001 (`BOOKING_WORKFLOW_URL`). Without it the app still works up to the "send" step.
 
-1. **`check_vocab_coverage.py`** -- confirms which candidate words exist in
-   the dataset, with clip counts. Edit `vocab.py` based on the output.
-2. **`download_subset.py`** -- downloads only the needed video files (not the
-   full dataset) into `data/videos/<word>/`.
-3. **`download_mediapipe_models.py`** -- one-time download (~10-15MB) of the
-   HandLandmarker/PoseLandmarker model files (see "Known constraints" below
-   for why this step exists).
-4. **`extract_landmarks.py`** -- runs MediaPipe over every clip, caches
-   normalized landmark features to `data/features/*.npy`. This is the slow
-   step; it's a one-time cost, cached so you can iterate on the model without
-   re-running it.
-5. **`train.py --model baseline`** then **`train.py --model gru`** -- trains
-   the pooled-MLP baseline (fast sanity check) and then the BiGRU+attention
-   sequence model (the real submission model). Both use a stratified
-   train/val split and class-weighted loss since per-word clip counts vary.
-6. **`infer.py --video <path>`** -- runs the trained model on a new clip,
-   prints top-k predicted words + confidence. This is the function signature
-   the rest of the call-agent workflow will eventually call per signed
-   utterance.
-7. **`app.py`** -- a FastAPI server exposing the model over HTTP AND
-   WebSocket, and serving the camera UI (`static/index.html`) at `/`. Run
-   `uvicorn app:app --host 0.0.0.0 --port 8000`, open `http://localhost:8000/`,
-   click "Start camera" once, then just sign naturally -- no per-word button
-   press. See "How live recognition actually works" below for how that's
-   possible given the model is trained on isolated word clips, not sentences.
+| Variable | Meaning |
+|---|---|
+| `GEMINI_API_KEY` | Reads ID and insurance card photos, and turns the request text into availability. Without it, fill the profile in by hand; the request-parsing step fails. |
+| `BOOKING_WORKFLOW_URL` | The signcall `POST /runs` URL, e.g. `http://localhost:8001/runs`. |
+| `GEMINI_MODEL` | Optional. Default `gemini-flash-latest`, with a fallback to `gemini-flash-lite-latest` when the model is overloaded (HTTP 429/503). |
 
-## How live recognition actually works
+Requirements: Python 3.11 or newer; `numpy<2` (pinned for the MediaPipe and PyTorch versions used). `torch` is a large download; the model runs fine on CPU.
 
-The model classifies one isolated sign at a time -- that's what the dataset
-and training are built on. But the UI can't reasonably ask a user to record
-a separate timed clip per word; a real accessibility tool has to let someone
-sign continuously, at their own pace. The gap between those two is bridged
-by `segmenter.py`:
+## What the app does
 
-- The browser streams a continuous sequence of frames to the server over a
-  WebSocket (`/ws/stream`), not a single video file.
-- The server runs the same MediaPipe landmark extraction on every frame
-  (`utils_landmarks.Landmarkers`, unchanged from the batch pipeline).
-- `segmenter.SignSegmenter` watches the hand-presence flag already built into
-  each frame's features and decides where one sign ends and the next begins:
-  a segment closes once hands have been absent (dropped to rest, out of
-  frame) for `ABSENT_FRAMES_FOR_BOUNDARY` consecutive frames. This mirrors
-  how the training clips themselves are structured (hand enters frame,
-  signs, leaves/rests) rather than relying on motion magnitude, which would
-  fail on signs that are mostly a held handshape.
-- The instant a segment closes, it's classified with the exact same model
-  and features as `infer.py` -- `infer.classify_features()` is shared code,
-  not a reimplementation.
+1. **Profile setup (once per browser).** Photograph an ID and an insurance card (Gemini fills in what is visible, never guessing), or type the details. Add family members who can interpret. Saved in a local SQLite file; there is no login, a "user" is a random ID kept in the browser.
+2. **A request.** Sign into the camera or type. The recognized words appear as a transcript the person can undo, clear and correct before confirming.
+3. **Parsing.** Gemini resolves "Tuesday 3" to a real date and time using today's date and returns structured availability. The person checks it, chooses the appointment type, and says whether they already have an interpreter.
+4. **Send.** The request is reshaped to signcall's input schema and posted to `POST /runs`.
+5. **Progress, approval, outcome.** The page follows the run, shows a plain proposal (date, time, clinic, interpreter) for a yes or no, and then the result. "More details" holds rates, requirements and notes.
+6. **Upcoming.** A list of booked future appointments, each with a Cancel button that works even days later or after the workflow server restarted.
 
-Be clear about the honest scope of this: it is NOT continuous sign language
-recognition in the research sense (fluid, coarticulated sentence signing).
-That needs continuous sentence-level training data, which this dataset
-doesn't have. What this is: continuous capture with automatic per-sign
-segmentation, so the user experience is "just sign," while the underlying
-model still only ever sees one isolated sign at a time -- which is what it
-was actually trained on.
+The UI is deliberately short on text, because it is meant for people who may not want to read long English paragraphs.
 
-**This has not been tuned against a real camera or a real signer** (this
-sandbox has neither). `segmenter.py`'s docstring flags exactly which
-constant to adjust and in which direction if signs get cut in half or two
-signs get merged together -- expect to spend real time on this once you're
-testing live, it's the one piece that couldn't be verified without a camera.
+## The sign model and its limits
 
-## What's been tested
+**Read this before relying on the camera.** The recognizer is a small proof of concept. Typing is the reliable path.
 
-The original Holistic-based version of this pipeline was run end-to-end
-against synthetic data (video generation -> extraction -> feature caching ->
-stratified split -> both models training -> checkpoint save/load ->
-inference) and passed. After switching to the Tasks API (see below), the
-feature-building logic (`extract_frame_features`, hand left/right assignment,
-normalization, the empty-detection case) was re-verified with mocked
-landmarker outputs, but **the full pipeline has NOT been re-run end-to-end
-against real MediaPipe output** -- this sandbox is blocked from downloading
-the Tasks API's model files (storage.googleapis.com), same as it's blocked
-from huggingface.co. Everything downstream of `extract_frame_features`
-(dataset/model/train/infer) is unchanged from the version that did pass the
-full synthetic test.
+### What it is
 
-**Run `smoke_test.py` in Colab/local first** (after `download_mediapipe_models.py`)
-to confirm the pipeline actually works end-to-end with real MediaPipe output
-before spending time on the real dataset download.
+- **Input features.** MediaPipe Tasks (`HandLandmarker` and `PoseLandmarker` lite) run on every frame. Each frame becomes a 227-number vector: 33 pose landmarks and 21 landmarks per hand (x, y, z), plus two flags for whether the left and right hands were seen. Coordinates are shifted to the midpoint of the shoulders and divided by shoulder width, so the signer's distance from the camera matters less. No face landmarks are used.
+- **Classifier.** A 2-layer bidirectional GRU (hidden size 128) with attention pooling and a linear head (`models.py`). Each clip is resampled to exactly 32 frames (`SEQ_LEN`).
+- **Output.** A softmax over **85 labels**: the 26 letters `a`-`z`, and 59 words (listed below). The checkpoint `model_gru_best.pt` is a bare PyTorch `state_dict`; `label_map.json` maps label to index.
+- **Live use.** The browser sends a JPEG frame about every 150 ms (roughly 7 frames per second) over a WebSocket (`/ws/stream`). The server extracts features per frame, `segmenter.py` cuts the stream into signs, and each segment is classified on its own.
 
-`app.py`'s HTTP layer (`/health`, `/predict`, static UI serving) and its
-WebSocket streaming protocol (`/ws/stream`) were both verified with a mocked
-model and a mocked `Landmarkers`, since this sandbox can't run the real
-model or real MediaPipe end-to-end. The WebSocket test specifically checked:
-a scripted present/absent frame sequence produces the correct `status`
-messages at the right moments, a segment boundary produces exactly one
-`word` message with the mocked model's output, and all of this coexists
-correctly with the `/health` and static-file routes on the same app.
-`segmenter.SignSegmenter` itself was unit-tested directly (no camera needed
-for this part): idle-only input never triggers, a full sign gets correctly
-trimmed and flushed, a brief detection blip mid-sign does NOT split it into
-two, too-short noise gets discarded, and the max-length safety cap fires
-when a boundary never comes. Separately confirmed with a real ffmpeg-encoded
-file: OpenCV decodes VP8-in-webm and individual JPEG frames correctly, so
-both the old file-upload path and the new frame-streaming path are sound at
-the format level.
+### Vocabulary (the complete list)
 
-What's NOT yet verified, because it requires a camera and a real trained
-checkpoint (neither available here): the actual segmentation thresholds
-against a real signer, and the full loop (browser camera -> WebSocket ->
-MediaPipe -> segmenter -> real model -> UI) end to end. Do that first, with
-`ABSENT_FRAMES_FOR_BOUNDARY` as the main dial to adjust, before relying on
-this for a demo.
+Letters: a b c d e f g h i j k l m n o p q r s t u v w x y z
 
-## Known constraints / things to revisit if time allows
+Words: address, afternoon, appointment, april, call, doctor, ear, early, eight, eleven, february, five, four, friday, heartbody, hello, help, hospital, hour, insurance, interpreter, late, later, lungs, march, minute, monday, morning, name, night, nine, no, now, one, phone, please, ready, saturday, seven, six, sunday, ten, thankyou, three, thursday, time, today, tomorrow, tuesday, two, wait, wednesday, week, when, where, yes, yesterday, zero
 
-- **MediaPipe uses the Tasks API** (`HandLandmarker` + `PoseLandmarker` in
-  `utils_landmarks.Landmarkers`), not the older `solutions.holistic` API.
-  Holistic was simpler (one call, no separate model files) but is gone for
-  good in current mediapipe releases -- confirmed Colab's Python 3.12 runtime
-  only has wheels for mediapipe >=0.10.30, none of which have `solutions`.
-  Run `download_mediapipe_models.py` once before extraction/inference/smoke
-  test -- it fetches the two small model files the Tasks API needs.
-- **Fixed 32-frame resampling** (`dataset.SEQ_LEN`) rather than variable-length
-  sequences with padding/masking -- simpler code, works fine for short
-  isolated-word clips, but loses some temporal detail on longer clips.
-- **Mirror augmentation is off by default** (`--mirror-prob 0.0`). It's
-  implemented (`utils_landmarks.mirror_features`) and is a real accessibility
-  win if it works (handedness invariance), but hasn't been validated against
-  real data yet -- try `--mirror-prob 0.5` and compare val accuracy once you
-  have real training data.
-- **Pose landmarks aren't left/right-swapped on mirror**, only hand blocks are
-  (see docstring) -- an approximation that's fine for now but worth revisiting
-  if pose position turns out to matter a lot for your chosen vocab.
-- No face landmarks are used, even though a few ASL signs incorporate facial
-  expression -- left out to keep the feature vector small and extraction fast
-  given the time budget.
+The word list was chosen for booking an appointment (days, times, numbers, a few medical words). It is a fraction of what a real appointment conversation needs: it has only three months (February, March, April), no body parts beyond ear, lungs and `heartbody`, no symptoms, no clinic types such as "dentist" or "eyes", no "cancel", and no way to say a medicine or a person's name. A person's name, address and insurance details are not signed at all; they come from the profile.
+
+### Why it is so limited
+
+- **Trained on isolated words, not on signing.** The training data is dictionary-style: one short clip per sign, a person's hands rise, perform a single sign and drop. The model learned to tell 85 such clips apart. It has never seen two signs in a row, fluent signing with the blending between signs (co-articulation), or a sentence. Continuous sign-language recognition is a separate research problem that needs sentence-level data and a different model; this project does not attempt it.
+- **Small vocabulary.** The project's data pipeline targeted a domain subset of about 90 words from a public dataset of roughly 2,200 isolated words (the `akasheroor/American-Sign-Language-Dataset` collection on Hugging Face, about 108,000 clips). Downloading and training on the whole set was not feasible on the available time and hardware, so a subset with a capped number of clips per word was used.
+- **Few examples per word, few signers.** With a cap on clips per word, and dictionary-style data that typically has few signers per sign, the model sees little variation in hand size, signing speed, lighting, camera angle and clothing. Real webcam conditions differ from the studio-like clips it learned from, so accuracy on a new person in a new room is expected to be well below what a clean test split would show.
+- **No recorded accuracy.** No held-out evaluation, confusion matrix or per-word accuracy was recorded with this checkpoint, and the training code is not in this repository. **Do not assume any particular accuracy.** Treat every word as a suggestion the person must verify.
+- **It always answers.** The classifier returns the most likely of the 85 labels for any segment, including a hand that is only moving or resting, a sign that is not in the vocabulary, or a different signer's different sign. The confidence number is shown in the UI ("Last sign ... % confident"), but there is no rejection threshold, so a wrong word with a confident-looking score is possible. As a sanity check, feeding the checkpoint 20 frames of random numbers returns the letter `c` at about 90%.
+- **Letters are single frames of a hand shape.** Fingerspelling is classified one letter at a time, and some letters depend on motion (j, z) or look nearly identical (m, n, s, t, e, a). Spelling out a name this way is error-prone and is not used for names in the booking flow.
+- **Segmentation is a heuristic.** `segmenter.py` starts a segment when a hand appears and ends it after 8 consecutive frames (about 1.2 s) with no hand visible. People who sign continuously, keep their hands in view between signs, or pause mid-sign get words merged or split. The thresholds were chosen for the ~7 fps capture rate and were not tuned across signers or cameras. The tuning guide is in the module docstring.
+- **Single signer, one person in frame, upper body visible.** MediaPipe pose is configured for one person. Both hands should be visible and the shoulders in frame (the features are normalised to them).
+- **Non-manual signals are ignored.** Facial expression, head movement and mouth shapes carry grammar in ASL (questions, negation, intensity). The model sees none of it.
+- **Handedness.** Left- and right-handed signers produce mirrored features. Whether the checkpoint was trained with mirror augmentation was not recorded, so assume a left-handed signer will do worse.
+- **Regional and personal variation.** ASL varies by region, age and signer, and one dictionary clip per sign cannot cover that.
+
+### What this means in practice
+
+Use the camera for the handful of vocabulary words above, one sign at a time with a clear pause and your hand out of view in between, then check the transcript before confirming. For anything else, type. Every word recognized lands in a visible transcript with undo and clear, and the transcript is confirmed by the person before it is parsed, so a bad recognition costs a retry rather than a wrong booking.
+
+### Improving it
+
+The useful directions are more signers and conditions per word, sentence-level (continuous) data with a CTC or transformer model, a held-out evaluation with per-word results, a rejection class and a confidence threshold, left/right-hand augmentation, and face landmarks. Training and dataset-preparation code is not part of this folder; `utils_landmarks.py` is the single source of truth for the feature layout, so any new model must be trained on exactly that 227-number layout, resampled with `sample_or_pad` to `SEQ_LEN` frames.
+
+## Files
+
+| Path | Purpose |
+|---|---|
+| `app.py` | FastAPI app: static UI, `/ws/stream`, Gemini endpoints, profile and booking storage, hand-off to signcall. |
+| `infer.py` | Loads the checkpoint and classifies a feature sequence; the command line classifies a video file (`python infer.py --video clip.mp4`). |
+| `models.py` | `BiGRUAttention`. |
+| `utils_landmarks.py` | MediaPipe wrapper, the 227-number feature layout, normalisation, resampling. |
+| `segmenter.py` | Splits the frame stream into one segment per sign. |
+| `gemini_client.py` | Card reading and request parsing, with retry and a lighter fallback model. |
+| `db.py` | SQLite: profiles and one row per booking. |
+| `static/` | The single-page UI (plain HTML, CSS, JavaScript; no build step). |
+| `model_gru_best.pt`, `label_map.json` | The trained checkpoint (about 2.5 MB) and its 85-label index. |
+| `models/hand_landmarker.task`, `models/pose_landmarker.task` | Google MediaPipe model files, used unmodified. They can be re-downloaded from `storage.googleapis.com/mediapipe-models/` (`hand_landmarker/hand_landmarker/float16/latest/` and `pose_landmarker/pose_landmarker_lite/float16/latest/`) and are covered by MediaPipe's own license. |
+| `data/app.db` | Created on first run; git-ignored. Holds real profile and booking data. |
+
+## HTTP and WebSocket API
+
+| Route | Purpose |
+|---|---|
+| `GET /health` | Whether the checkpoint is present. |
+| `WS /ws/stream` | Client sends one JPEG per binary message. Server sends `{"type":"status","signing":bool}`, `{"type":"word","word":"...","confidence":0-1}` or `{"type":"error","message":"..."}`. |
+| `POST /extract-card` | One card photo in, profile fields out. |
+| `POST /parse-booking` | Transcript in, structured availability out. |
+| `GET` / `POST /profile/{user_id}` | Read or save the profile. |
+| `POST /submit-booking` | Reshape and forward to signcall; returns the run id and the plan text. |
+| `GET /bookings/{run_id}?user_id=` | Progress, proposal, result; refreshes from signcall if a notification was missed. |
+| `POST /bookings/{run_id}/confirm` | The person's yes or no to the proposal. |
+| `POST /bookings/{run_id}/cancel` | Cancel a booked appointment. |
+| `GET /appointments/upcoming?user_id=` | Booked future appointments. |
+| `POST /notifications` | Receives signcall's events (its `SIGNCALL_NOTIFY_URL`). |
+
+There is no authentication and CORS is open. This is a local demo server; do not expose it to a network.
+
+## Privacy
+
+The profile (name, phone, date of birth, address, insurance, family contacts) and booking records are stored unencrypted in `data/app.db`. Card photos are sent to Gemini for reading and are not stored by this app. Camera frames are processed in memory and not saved. Camera access is requested by the browser, and only on `localhost` or HTTPS.

@@ -12,20 +12,18 @@
 
   <!-- ================= PROFILE: METHOD ================= -->
   <section id="profileMethod" class="screen">
-    <h1>Let's set up your profile</h1>
-    <p class="hint">This only happens once.</p>
+    <h1>Set up your profile</h1>
 
     <button id="btnUpload" class="choice-card">
       <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h3l1.5-2h7L17 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.4"/></svg></span>
       <span>
-        <span class="label">Upload my ID &amp; insurance card</span>
-        <span class="sub">We'll fill in your details automatically</span>
+        <span class="label">Upload ID &amp; insurance card</span>
       </span>
     </button>
     <button id="btnManual" class="choice-card">
       <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="12" rx="2.2"/><path d="M7.2 10h.01M11 10h.01M14.8 10h.01M17.4 10h.01M7.2 14h10.2"/></svg></span>
       <span>
-        <span class="label">Type my details myself</span>
+        <span class="label">Type my details</span>
       </span>
     </button>
   </section>
@@ -33,7 +31,6 @@
   <!-- ================= PROFILE: UPLOAD ================= -->
   <section id="profileUpload" class="screen">
     <h1>Upload your cards</h1>
-    <p class="hint">A clear photo of each card. You can still fix anything on the next screen.</p>
     <div id="uploadError" class="banner error"></div>
 
     <label class="upload-tile" id="idTile" for="idCardInput">
@@ -58,8 +55,7 @@
 
   <!-- ================= PROFILE: VERIFY / MANUAL ENTRY ================= -->
   <section id="profileVerify" class="screen">
-    <h1>Check your details</h1>
-    <p class="hint">Fix anything that's wrong or missing.</p>
+    <h1>Check your details</h1><br>
     <div id="profileError" class="banner error"></div>
 
     <div class="field"><label>Full name</label><input type="text" id="pf_name"></div>
@@ -79,13 +75,13 @@
 
   <!-- ================= FAMILY LIST ================= -->
   <section id="familyList" class="screen">
-    <h1>Family who could interpret</h1>
-    <p class="hint">Part of your profile, like your insurance info. Optional -- add anyone who could help, or skip this.</p>
+    <h1>Family who can interpret</h1>
+    <p class="hint">Optional.</p>
     <div id="familyError" class="banner error"></div>
 
     <div id="familyCards"></div>
-    <p class="hint" id="familyEmptyHint">No family added yet.</p>
-    <button id="btnAddFamily" class="btn btn-secondary" style="margin-bottom:16px;">+ Add a family member</button>
+    <p class="hint" id="familyEmptyHint">None yet.</p>
+    <button id="btnAddFamily" class="btn btn-secondary" style="margin-bottom:16px;">+ Add family</button>
 
     <div class="actions">
       <button id="btnFamilyContinue" class="btn btn-primary">Continue</button>
@@ -107,7 +103,7 @@
   <!-- ================= INPUT METHOD (TYPE OR SIGN) ================= -->
   <section id="inputMethod" class="screen">
     <h1>What do you need?</h1>
-    <p class="hint">Tell us the clinic visit and times you want, e.g. "book doctor Tuesday 3, 4:30".</p>
+    <p class="hint">e.g. "dentist Tuesday 3pm"</p>
 
     <div class="toggle-row">
       <button id="methodType" class="active">Type</button>
@@ -135,33 +131,31 @@
 
     <div class="actions">
       <button id="btnUseTranscript" class="btn btn-primary" disabled>Use this</button>
-      <button id="btnViewHistory" class="btn btn-text">My bookings</button>
-      <button id="btnEditProfile" class="btn btn-text">Edit my profile</button>
+      <button id="btnViewUpcoming" class="btn btn-text">Upcoming</button>
+      <button id="btnEditProfile" class="btn btn-text">Profile</button>
     </div>
   </section>
 
-  <!-- ================= BOOKING HISTORY ================= -->
-  <section id="history" class="screen">
-    <h1>My bookings</h1>
-    <p class="hint">Every request you've submitted, most recent first.</p>
-    <div id="historyError" class="banner error" role="alert"></div>
-    <div id="historyList"></div>
-    <p id="historyEmpty" class="hint" hidden>Nothing here yet.</p>
+  <!-- ================= UPCOMING APPOINTMENTS ================= -->
+  <section id="upcoming" class="screen">
+    <h1>Upcoming</h1><br>
+    <div id="upcomingError" class="banner error" role="alert"></div>
+    <div id="upcomingList"></div>
+    <p id="upcomingEmpty" class="hint" hidden>None.</p>
     <div class="actions">
-      <button id="btnHistoryBack" class="btn btn-text">Back</button>
+      <button id="btnUpcomingBack" class="btn btn-text">Back</button>
     </div>
   </section>
 
   <!-- ================= BOOKING CONFIRM ================= -->
   <section id="bookingConfirm" class="screen">
-    <h1>Confirm your request</h1>
-    <p class="hint">Check everything below before sending.</p>
+    <h1>Confirm request</h1>
     <div id="bookingError" class="banner error"></div>
 
     <div id="bc_profileSummary"></div>
 
     <div class="field" style="margin-top:16px;">
-      <label>Type of clinic</label>
+      <label>Clinic type</label>
       <select id="bc_clinicType"></select>
     </div>
     <div class="field">
@@ -170,21 +164,22 @@
     </div>
 
     <div class="field">
-      <label>Available date &amp; time</label>
+      <label>Date &amp; time</label>
+      <p class="hint" style="margin:0 0 8px;">We find a slot within that hour.</p>
       <div id="availabilityRows"></div>
-      <button id="btnAddAvailability" class="btn btn-secondary">+ Add another time</button>
+      <button id="btnAddAvailability" class="btn btn-secondary">+ Add time</button>
     </div>
 
     <div class="field">
-      <label>Interpreter for this visit</label>
+      <label>Interpreter</label>
     </div>
     <button id="bc_interpreterHave" class="choice-card">
       <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M8.2 12.3l2.4 2.4L15.8 9"/></svg></span>
-      <span class="label">I already have one</span>
+      <span class="label">I have one</span>
     </button>
     <button id="bc_interpreterNeed" class="choice-card">
       <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.7" cy="8.5" r="2.6"/><path d="M3.8 18c.6-2.9 2.5-4.4 4.9-4.4s4.3 1.5 4.9 4.4"/><circle cx="16.8" cy="9.4" r="2.1"/><path d="M15 13.4c1.8.3 3.2 1.6 3.7 3.9"/></svg></span>
-      <span class="label">I need help finding one</span>
+      <span class="label">Find one for me</span>
     </button>
     <div id="bc_familyReview" style="display:none; margin-bottom:16px;"></div>
 
@@ -198,26 +193,14 @@
   <section id="progress" class="screen">
     <div class="status-block">
       <div class="spinner"></div>
-      <h1 id="progressTitle">Finding your appointment</h1>
+      <h1 id="progressTitle">Finding appointment</h1>
       <p class="hint" id="progressText" role="status" aria-live="polite"></p>
     </div>
-    <p class="hint" id="progressSummaryText" style="margin:0 0 4px;"></p>
-
-    <!-- The full call-by-call plan (what's shared, with whom, on which call)
-         stays available -- nothing here is hidden -- but isn't forced reading
-         by default. See AGENTS.md phone-call safety rules: explicit user
-         intent / consent still has to be satisfiable, just not at the cost of
-         a wall of English prose on every single run. -->
-    <details id="progressMore" class="more-details" hidden>
-      <summary>Full details</summary>
-      <p class="hint" id="progressPlanText" style="margin:0;"></p>
-    </details>
   </section>
 
   <!-- ================= CONFIRM (YOUR GO / NO-GO) ================= -->
   <section id="confirm" class="screen">
-    <h1>Approve this appointment?</h1>
-    <p class="hint">Nothing is booked until you say yes.</p>
+    <h1>Book this?</h1>
     <div id="confirmError" class="banner error" role="alert"></div>
 
     <div id="confirmDetails"></div>
@@ -226,18 +209,18 @@
       <summary>More details</summary>
       <div id="confirmMoreDetails"></div>
       <div id="confirmRequirements" class="notice" hidden>
-        <div class="notice-title">Required for this appointment</div>
+        <div class="notice-title">Required</div>
         <ul id="confirmRequirementsList"></ul>
       </div>
       <div id="confirmNotes" class="notice notice-muted" hidden>
-        <div class="notice-title">Also mentioned on the calls</div>
+        <div class="notice-title">Notes</div>
         <ul id="confirmNotesList"></ul>
       </div>
     </details>
 
     <div class="actions">
-      <button id="btnApprove" class="btn btn-primary">Yes, book it</button>
-      <button id="btnDecline" class="btn btn-danger">No, don't book</button>
+      <button id="btnApprove" class="btn btn-primary">Yes, book</button>
+      <button id="btnDecline" class="btn btn-danger">No</button>
     </div>
   </section>
 
@@ -258,11 +241,11 @@
       <summary>More details</summary>
       <div id="doneMoreDetails"></div>
       <div id="doneRequirements" class="notice" hidden>
-        <div class="notice-title">Required for this appointment</div>
+        <div class="notice-title">Required</div>
         <ul id="doneRequirementsList"></ul>
       </div>
       <div id="doneNotes" class="notice notice-muted" hidden>
-        <div class="notice-title">Also mentioned on the calls</div>
+        <div class="notice-title">Notes</div>
         <ul id="doneNotesList"></ul>
       </div>
     </details>
@@ -271,7 +254,7 @@
 
     <div class="actions">
       <button id="btnCancelAppointment" class="btn btn-danger" hidden>Cancel appointment</button>
-      <button id="btnBookAnother" class="btn btn-primary">Book something else</button>
+      <button id="btnBookAnother" class="btn btn-primary">New request</button>
     </div>
   </section>
 

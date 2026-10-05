@@ -1,34 +1,18 @@
 """
-The text-input testing harness described in the top-level README's
-"Test the pipeline with typed text" section.
+The test suite for the workflow: one named scenario per behavior, each asserting
+in-process so a regression fails loudly. Run a scenario by name from the
+directory above signcall/ (never from inside it; see the README):
+
+    cd apps/web/asl_accessibility
+    python3 -m signcall.dev.text_harness clinic_search
 
 Every scenario builds a plain JSON object and runs it through
-`workflow.user_input.load_user_input()`, so the committed schema
-(schemas/user_input.schema.json) is exercised on every run rather than being
-documentation nobody executes.
-
-This stands in for two things that aren't built yet:
-
-  1. Whatever eventually produces that JSON (a signing UI, a form, a stored
-     profile). The workflow doesn't care which.
-  2. A real CALL-E account. CALLE_MOCK_MODE=1 scripts every phone number's
-     response instead of placing real calls, so the whole sequence (clinic
-     batch search, family list, freelance batches, decline-and-retry, the
-     already-have-an-interpreter path) can be exercised for free.
-
-Every scenario asserts in-process, so a regression fails loudly instead of
-printing a plausible-looking result. Mock resolvers branch on the call's
-PURPOSE as well as the phone number, because the winning clinic's number is
-called twice per run (search, then book) and an interpreter's up to twice
-(availability, then binding confirm) -- the phone alone can't tell those apart.
-
-Run from `apps/` (the parent of `signcall/`), NOT from inside
-`apps/signcall/` itself:
-    python3 -m signcall.frontend.text_harness clinic_search
-Running from inside apps/signcall/ puts that directory on sys.path, which
-makes `import calle` in calle/run.py resolve to THIS app's own calle/ adapter
-folder instead of the real installed calle-ai SDK -- a real bug hit during
-development. See README.md's naming-collision section.
+`load_user_input()`, so the input schema is exercised on every run.
+CALLE_MOCK_MODE=1 is forced, and every phone number's response is scripted with
+`register_mock()`, so the whole workflow runs without a network or credits.
+Mock resolvers branch on the call's purpose as well as the phone number,
+because one number can be called twice per run (a clinic for search then book,
+an interpreter for availability then confirm).
 """
 
 import json
@@ -41,24 +25,23 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# Forced, not defaulted: signcall/.env may say CALLE_MOCK_MODE=0, and this
-# harness must never be able to place a real call.
+# Forced rather than defaulted: .env may say CALLE_MOCK_MODE=0, and the harness
+# must never be able to place a real call.
 os.environ["CALLE_MOCK_MODE"] = "1"
 
 from ..calle import run as calle_run  # noqa: E402
 from ..calle.run import CallPurpose, CallResult, register_mock  # noqa: E402
 from ..workflow import clinic_lookup, interpreter_lookup, interpreter_matching  # noqa: E402
 from ..workflow.appointment import run_interpreter_mesh as _run_interpreter_mesh  # noqa: E402
-from ..workflow.confirmation import BookingDeclined, BookingProposal  # noqa: E402
+from ..workflow.confirmation import BookingDeclined, BookingProposal, NoMatchFound  # noqa: E402
 from ..workflow.types import AppointmentType, ClinicCandidate, InterpreterCandidate  # noqa: E402
 from ..workflow.user_input import UserInputError, load_user_input  # noqa: E402
 
 USER_PHONE = "+17025550999"
-USER_ZIP = "89101"  # Las Vegas -- this build's data is Nevada-scoped
+USER_ZIP = "89101"  # Las Vegas
 
 # Every call placed in a scenario, in order, as (phone, task, purpose).
-# Scenarios assert against this to prove which calls were NOT placed -- which
-# is where most of this design's behaviour lives.
+# Scenarios assert against it to prove which calls were not placed.
 CALLS: list[tuple[str, str, CallPurpose]] = []
 
 # Every proposal the workflow put to the user, in order.
@@ -71,14 +54,9 @@ def _reset() -> None:
 
 
 def _force_parallel_batch(on: bool) -> bool:
-    """PARALLEL_BATCH_CALLS defaults to OFF (sequential dispatch) in
-    production -- see interpreter_matching's module docstring -- but
-    scenario_freelance_parallel exists specifically to prove the PARALLEL
-    dispatch path still works when it's turned on. It forces this here and
-    restores it with _restore_parallel_batch() before returning. Not
-    reentrant/thread-safe, but every scenario in this file runs in its own
-    fresh process (see the module docstring's run instructions), so nothing
-    here ever overlaps."""
+    """Turns parallel batch dispatch on or off for one scenario and returns the
+    previous value for _restore_parallel_batch(). Not thread-safe, but each
+    scenario runs in its own process."""
     old = interpreter_matching.PARALLEL_BATCH_CALLS
     interpreter_matching.PARALLEL_BATCH_CALLS = on
     return old
@@ -156,12 +134,9 @@ _WEEKDAY_CYCLE = ["monday", "tuesday", "wednesday", "thursday", "friday", "satur
 
 
 def _slot_with_wrong_weekday(day_offset: int, time: str) -> dict:
-    """Same as _slot(), but `day` is deliberately wrong for `date` -- the next
-    name in the weekday cycle, so it can never accidentally agree. A past
-    version of this test hardcoded "sunday" here, which is only a mismatch
-    on days when day_offset days from now ISN'T actually a Sunday -- a real,
-    found bug (it fails every time that coincidence lines up, e.g. when
-    today + 3 days really is a Sunday)."""
+    """Like _slot(), but `day` is deliberately wrong for `date`: the next name
+    in the weekday cycle, so the two can never agree by coincidence whatever
+    day the test runs."""
     slot = _slot(day_offset, time)
     wrong_index = (_WEEKDAY_CYCLE.index(slot["day"]) + 1) % 7
     return {**slot, "day": _WEEKDAY_CYCLE[wrong_index]}
@@ -202,13 +177,12 @@ def clinic(
     cancels: bool = True,
     offers_alternate: "tuple[str, str] | None" = None,
 ) -> ClinicCandidate:
-    """Registers this clinic's scripted responses and returns the candidate
-    object, so scenarios can assert on what the search wrote back into it.
-    `blocked_reason` makes the BOOKING call refuse (booked False); `cancels`
-    says whether a later CANCEL call succeeds. `offers_alternate=(date, time)`
-    scripts a misbehaving booking call that reports booked=True for a
-    DIFFERENT date/time than whatever was actually asked for -- a real,
-    confirmed bug (see scenario_clinic_alternate_date_rejected)."""
+    """Registers this clinic's scripted responses and returns the candidate, so
+    scenarios can assert on what the search wrote back into it.
+    `blocked_reason` makes the booking call refuse; `cancels` says whether a
+    later cancel call succeeds; `offers_alternate=(date, time)` scripts a
+    booking call that reports booked=True for a different date or time than
+    was asked for."""
 
     def resolver(task, phone_, purpose):
         CALLS.append((phone_, task, purpose))
@@ -234,9 +208,8 @@ def clinic(
         if not answers:
             return _no_answer()
         if not accepts_insurance:
-            # A clinic that says no is never asked about slots -- that branch
-            # happens inside CALL-E's own conversation, so what's assertable
-            # here is that no slots ever come back.
+            # That branch happens inside the call itself, so all that can be
+            # asserted is that no slots come back.
             return _ok({"accepts_insurance": False})
         return _ok({
             "accepts_insurance": True,
@@ -256,11 +229,9 @@ def family(
     name: str, relation: str, phone: str, *,
     covers: tuple = (), answers: bool = True, confirms: bool = True,
 ) -> dict:
-    """`confirms` scripts the answer to the LATER binding confirm call (after
-    booking), separately from `covers`/`answers`, which scripts the earlier
-    availability call -- a member can say yes to availability and still
-    decline the binding confirm, or never be asked availability at all and
-    still be reached directly for a confirm (the fallback path)."""
+    """`confirms` scripts the later binding confirm, separately from
+    `covers`/`answers`, which script the availability call: a member can say
+    yes to availability and still decline the confirm."""
 
     def resolver(task, phone_, purpose):
         CALLS.append((phone_, task, purpose))
@@ -284,13 +255,11 @@ def freelancer(
     confirms: bool = True,
     answers: bool = True,
     register: bool = True,
-    zipcode: str = USER_ZIP,
-    distance: float = 2.0,
     wait_for: "threading.Barrier | None" = None,
 ) -> InterpreterCandidate:
-    """`register=False` deliberately leaves this number unmocked, so any call
-    to it raises KeyError loudly rather than failing silently. `wait_for` makes
-    the availability call block on a barrier, to prove calls overlap."""
+    """`register=False` leaves this number unmocked, so any call to it raises
+    KeyError instead of failing silently. `wait_for` makes the availability
+    call block on a barrier, to prove calls overlap."""
 
     def resolver(task, phone_, purpose):
         CALLS.append((phone_, task, purpose))
@@ -309,26 +278,22 @@ def freelancer(
     if register:
         register_mock(phone, resolver)
     return InterpreterCandidate(
-        name=name, phone=phone, zipcode=zipcode, city="Las Vegas",
-        age=40, expertise=["medical"], distance_miles=distance, source="injected",
+        name=name, phone=phone, expertise=["medical"], source="injected",
     )
 
 
 # --- scenarios -----------------------------------------------------------
 
 def scenario_clinic_search() -> None:
-    """
-    The finalized workflow end-to-end: an insurance-gated clinic search that
-    calls clinics one at a time, nearest first, and stops at the first match;
-    then family, then a freelance batch that tie-breaks by rate; then the user
-    is asked, the callback booking (the only call that identifies the patient)
-    is placed, and both confirmation texts go out.
+    """The full workflow: an insurance-gated clinic search, one clinic at a time
+    nearest first, stopping at the first match; then family, then a freelance
+    batch that tie-breaks by rate; then the user is asked, the booking call
+    (the only one that identifies the patient) is placed, and both
+    confirmation texts go out.
 
-    The nearest three clinics fail three different ways -- declines insurance /
-    accepts but no overlapping slot / doesn't answer -- and a fourth declines
-    too, so the search moves on. The next one matches and wins. Nothing after
-    it is called, including a farther clinic that would also have matched.
-    """
+    Earlier clinics fail three ways (declines insurance, no overlapping slot,
+    no answer), then the nearest match wins. Nothing after it is called,
+    including a farther clinic that would also have matched."""
     _reset()
     thu, fri, mon = _date(3), _date(4), _date(7)
 
@@ -438,13 +403,10 @@ def scenario_clinic_search() -> None:
 
 
 def scenario_shortcut() -> None:
-    """has_interpreter: true. Step 3 is trivially satisfied by Step 2's clinic
-    match; the same insurance-gated search still runs. No contact details are
-    collected for the user's own interpreter, so nobody is called or texted
-    about them and only the user gets a confirmation text.
-
-    The slot is chosen at random among the matched ones, so this seeds RNG for
-    reproducible demo takes and asserts membership, not equality."""
+    """has_interpreter: true. The same insurance-gated clinic search runs, but
+    nobody is called or texted about the user's own interpreter, and only the
+    user gets a confirmation text. The slot is chosen at random among the
+    matched ones, so this seeds the RNG and asserts membership, not equality."""
     _reset()
     random.seed(0)
     thu, fri, mon = _date(3), _date(4), _date(7)
@@ -516,13 +478,9 @@ def scenario_decline_then_retry() -> None:
 
 
 def scenario_cheapest_wrong_day() -> None:
-    """
-    Regression test for a real, confirmed bug: the cheapest responding
-    candidate could only cover Monday, but the old code booked and confirmed
-    her for Thursday, because coverable_slots was read as a truthiness check
-    and discarded. The cheapest-by-rate candidate still wins -- but the slot
-    is derived from HER OWN answer, so the correct outcome is Monday.
-    """
+    """The cheapest candidate can only cover Monday. She still wins on rate, but
+    the booked slot is derived from her own answer, so Monday is booked and
+    confirmed, never a slot she didn't name."""
     _reset()
     thu, mon = _date(3), _date(7)
     matched = clinic("Clinic", "+17025551001", 1.0,
@@ -552,19 +510,13 @@ def scenario_cheapest_wrong_day() -> None:
 
 
 def scenario_family_locks_in() -> None:
-    """
-    Family is a definite, ordered, call-only list checked AFTER the clinic
-    match. The first member doesn't answer; the second can cover a matched
-    slot and is locked in, and nobody further is called during the search.
-    Once the clinic is booked, that same member gets a binding confirm call
-    (Step 5) before anyone is texted -- their earlier "yes" was to a slot that
-    wasn't booked yet.
+    """Family is an ordered, call-only list checked after the clinic match. The
+    first member doesn't answer; the second can cover a matched slot and is
+    locked in; nobody further is called. Once the clinic is booked, that member
+    gets a binding confirm before anyone is texted.
 
-    Freelance candidates ARE passed but deliberately left unmocked -- if
-    family were skipped, or its confirm skipped or declined, the run would
-    try to call them and raise KeyError loudly instead of quietly succeeding
-    another way.
-    """
+    Freelance candidates are passed but left unmocked, so if the family path
+    were skipped or failed, the run would call them and raise KeyError."""
     _reset()
     thu, mon = _date(3), _date(7)
     matched = clinic("Clinic", "+17025551001", 1.0,
@@ -616,20 +568,13 @@ def scenario_family_locks_in() -> None:
 
 
 def scenario_family_confirm_fallback() -> None:
-    """
-    The binding family confirm (Step 5) can fail, and three things can happen
-    next, each its own phase below:
+    """What happens when the binding family confirm fails, in three phases:
 
-      A. The locked-in member declines; the next member on the list, never
-         asked during the search, is reached directly and confirms. Source
-         stays "family".
-      B. Every family member declines; a freelance search for this one
-         already-booked slot finds someone who confirms. Source flips to
-         "freelance" -- exactly the tier that would have run if no family
-         member had matched in the first place.
-      C. Nobody -- family or freelance -- confirms, so the clinic booking is
-         cancelled.
-    """
+      A. The locked-in member declines; the next member, never asked during
+         the search, is reached directly and confirms. Source stays "family".
+      B. Every family member declines; a freelance search for the booked slot
+         finds someone who confirms. Source becomes "freelance".
+      C. Nobody confirms, so the clinic booking is cancelled."""
     _reset()
     thu = _date(3)
 
@@ -733,8 +678,9 @@ def scenario_clinic_search_exhausted() -> None:
     try:
         run_interpreter_mesh(load_user_input(_input_json()),
                              clinics=clinics + [would_match], candidates=[])
-    except RuntimeError as exc:
+    except NoMatchFound as exc:
         print(f"\n--- RAISED (expected) ---\n{exc}")
+        assert "No clinic we called" in str(exc), str(exc)
     else:
         raise AssertionError("BUG: should have raised -- no clinic matched")
 
@@ -743,6 +689,80 @@ def scenario_clinic_search_exhausted() -> None:
     assert would_match.phone not in _phones_called(), "BUG: searched past the ceiling"
     print("\nOK: exactly 10 clinics called, one at a time, ceiling "
           "respected, nothing booked.")
+
+
+def scenario_no_interpreter_available() -> None:
+    """A clinic matches, but no freelance interpreter can cover the time. The
+    run ends as NoMatchFound BEFORE the user is asked anything: the clinic is
+    never booked, so there's nothing to undo."""
+    _reset()
+    thu = _date(3)
+    matched = clinic("Match", "+17025552500", 1.0, slots=((thu, "14:00"),))
+    a = freelancer("A", "+17025553501", covers=())
+    b = freelancer("B", "+17025553502", covers=())
+
+    try:
+        run_interpreter_mesh(
+            load_user_input(_input_json()), clinics=[matched], candidates=[a, b]
+        )
+    except NoMatchFound as exc:
+        print(f"\n--- RAISED (expected) ---\n{exc}")
+        assert "No interpreter we called" in str(exc), str(exc)
+    else:
+        raise AssertionError("BUG: should have raised -- no interpreter could cover the time")
+
+    assert not PROPOSALS, "the user is only asked once there is something to approve"
+    assert CallPurpose.CLINIC_BOOK not in [p for _, _, p in CALLS], "BUG: booked with no interpreter"
+    assert {a.phone, b.phone} <= set(_phones_called()), "both interpreters should have been asked"
+    print("\nOK: both interpreters said no, the run ended as 'nothing booked', "
+          "the clinic was never booked, and the user was never asked to approve.")
+
+
+def scenario_call_scripts() -> None:
+    """Every kind of call opens by saying it's an AI agent and ends with the
+    brevity rule. One family run and one freelance run, each through booking
+    and cancellation, exercise every CallPurpose; the test also fails if a new
+    call type is added without the disclosure."""
+    import dataclasses  # noqa: PLC0415
+
+    from ..workflow.appointment import cancel_appointment  # noqa: PLC0415
+
+    _reset()
+    thu = _date(3)
+    seen: list = []
+
+    clinic_one = clinic("Clinic One", "+17025552801", 1.0, slots=((thu, "14:00"),))
+    maya = family("Maya Reyes", "sister", "+17025552802", covers=(f"{thu} 14:00",))
+    result = run_interpreter_mesh(
+        load_user_input(_input_json(family_members=[maya])), clinics=[clinic_one], candidates=[]
+    )
+    assert result.interpreter_source == "family", result.interpreter_source
+    cancel_appointment(dataclasses.asdict(result), "Dana Reyes")
+    seen += CALLS
+
+    _reset()
+    clinic_two = clinic("Clinic Two", "+17025552803", 1.0, slots=((thu, "14:00"),))
+    kim = freelancer("J. Kim", "+17025552804", covers=(f"{thu} 14:00",), rate=80.0)
+    result = run_interpreter_mesh(
+        load_user_input(_input_json()), clinics=[clinic_two], candidates=[kim]
+    )
+    assert result.interpreter_source == "freelance", result.interpreter_source
+    cancel_appointment(dataclasses.asdict(result), "Dana Reyes")
+    seen += CALLS
+
+    assert {p for _, _, p in seen} == set(CallPurpose), (
+        f"a CallPurpose was never exercised (or one is new and untested): "
+        f"{set(CallPurpose) - {p for _, _, p in seen}}"
+    )
+    for _, task, purpose in seen:
+        assert "AI agent" in task[:130], (
+            f"BUG: a {purpose.value} call doesn't open by saying it's an AI agent: {task[:130]!r}"
+        )
+        assert task.endswith(calle_run.CALL_STYLE), (
+            f"BUG: a {purpose.value} call is missing the brevity rule"
+        )
+    print(f"\nOK: all {len(set(CallPurpose))} call types open by saying they're an AI "
+          "agent and end with the brevity rule.")
 
 
 def scenario_requirements() -> None:
@@ -816,20 +836,13 @@ def scenario_requirements() -> None:
 
 
 def scenario_clinic_alternate_date_rejected() -> None:
-    """Regression test for a real, confirmed bug: the user approved
-    2026-09-30, the clinic offered 2026-10-01 instead, and the calling agent
-    accepted it and reported booked=True. Nothing checked WHICH date was
-    actually confirmed, so the run went on to tell the interpreter and the
-    user about 2026-09-30 -- a date that was never actually booked.
-
-    A booking call that reports a different confirmed_date/confirmed_time
-    than what was asked for must be treated exactly like a refusal: the run
-    ends there, and nothing after book_slot() -- no interpreter confirm, no
-    confirmation texts -- may ever run."""
+    """The user approves one date and the clinic's booking call reports a
+    different one. That must be treated exactly like a refusal: the run ends,
+    and nothing after book_slot() (interpreter confirm, confirmation texts)
+    may run."""
     _reset()
-    approved = _date(3)       # what the user actually approved -- 14:00 overlaps
-                              # the default input's free window on this day
-    offered = _date(4)        # what the clinic offers instead, mid-booking-call
+    approved = _date(3)       # what the user approved
+    offered = _date(4)        # what the clinic books instead
     switcheroo = clinic("FYZICAL Therapy", "+17025551091", 1.0,
                         slots=((approved, "14:00"),),
                         offers_alternate=(offered, "14:00"))
@@ -866,20 +879,11 @@ def scenario_clinic_alternate_date_rejected() -> None:
 
 
 def scenario_freelance_parallel() -> None:
-    """Proves the PARALLEL dispatch mode still works, even though
-    PARALLEL_BATCH_CALLS defaults to OFF today -- a shared/free CALL-E line
-    only places one call at a time on the account's behalf, so dialling a
-    batch at once gains nothing until a dedicated number is bought. This
-    scenario temporarily forces it on to prove the capability is there for
-    when that happens, without changing the production default. The batch
-    SIZE (2) is unaffected either way -- see interpreter_matching's module
-    docstring for why size and dispatch are two different knobs.
-
-    Each availability call waits at a barrier that only opens once both are
-    in flight, so a sequential dispatch would leave the barrier waiting and
-    fail here. The cheapest is last in the batch and the rates are out of
-    order, so the ranking can't be an accident of which call happened to
-    finish first."""
+    """Parallel batch dispatch works when turned on (it defaults to off). Each
+    availability call waits at a barrier that opens only once both are in
+    flight, so sequential dispatch would fail here. The cheapest candidate is
+    last in the batch and the rates are out of order, so the ranking can't be
+    an accident of which call finished first."""
     _reset()
     real_parallel = _force_parallel_batch(True)
     try:
@@ -907,20 +911,15 @@ def scenario_freelance_parallel() -> None:
         assert next_batch.phone not in _phones_called(), "a match in the first batch ends the search"
     finally:
         _restore_parallel_batch(real_parallel)
-    print("\nOK: with parallel dispatch forced on for this test, both "
-          "freelancers were in flight at once, the cheapest won regardless "
-          "of arrival order, and no second batch was called. (Production "
-          "default stays sequential -- see SIGNCALL_FREELANCE_PARALLEL_BATCH.)")
+    print("\nOK: with parallel dispatch on, both freelancers were in flight at "
+          "once, the cheapest won regardless of arrival order, and no second "
+          "batch was called.")
 
 
 def scenario_sequential_batch_calls_both() -> None:
-    """Regression test for the exact misunderstanding this design almost
-    shipped with: sequential dispatch must still call EVERY member of the
-    batch and still pick the cheapest of them -- it must NOT stop as soon as
-    the first one says yes. Both freelancers here are available; the one
-    dialled FIRST is the pricier one, so if the search stopped at the first
-    yes (wrong), the pricier one would win. Cheapest-wins here proves the
-    second one was actually called and compared, not skipped."""
+    """Sequential dispatch must still call every member of the batch and pick
+    the cheapest, not stop at the first yes. The one dialled first is pricier,
+    so the cheaper one winning proves the second was called and compared."""
     assert not interpreter_matching.PARALLEL_BATCH_CALLS, (
         "this scenario asserts call ORDER, which only means something under "
         "sequential dispatch -- it isn't meaningful (or reliable) in parallel mode"
@@ -1083,10 +1082,10 @@ def scenario_input_validation() -> None:
 
 
 def scenario_clinic_lookup() -> None:
-    """The Apify Google Maps parser, against canned dataset items -- no
-    network. Covers the field mapping, every reason a place gets dropped, the
-    four-field record schema, phone-based de-duplication, None-distance
-    sorting, the inspection dump file, and the synthetic fallback."""
+    """The Apify Google Maps parser against canned dataset items, with no
+    network: field mapping, every reason a place is dropped, the record schema,
+    phone de-duplication, the inspection dump file, and an honest empty result
+    (not fabricated clinics) when there is no token."""
     _reset()
     items = [
         {  # complete listing: phoneUnformatted preferred, ZIP+4 trimmed
@@ -1172,12 +1171,7 @@ def scenario_clinic_lookup() -> None:
         "an out-of-table ZIP must yield None, not a guess"
     )
 
-    # No synthetic fallback: a missing token (same as any other live-search
-    # failure) comes back as an empty list, not fabricated clinics -- an
-    # earlier version degraded to a committed synthetic dataset here, removed
-    # because a fake clinic that LOOKS like a real, callable result is worse
-    # than an honest failure (appointment.py raises a clear error on an empty
-    # list).
+    # A missing token, like any live-search failure, returns an empty list.
     dump = Path(tempfile.mkdtemp()) / "clinics_last_search.json"
     saved = os.environ.pop("APIFY_API_TOKEN", None)
     try:
@@ -1185,7 +1179,7 @@ def scenario_clinic_lookup() -> None:
     finally:
         if saved is not None:
             os.environ["APIFY_API_TOKEN"] = saved
-    assert empty == [], "BUG: a missing token must not quietly hand back synthetic clinics"
+    assert empty == [], "BUG: a missing token must not hand back any clinics"
 
     dumped = json.loads(dump.read_text())
     assert dumped["source"] == "apify_google_maps" and dumped["searched_zipcode"] == USER_ZIP
@@ -1193,70 +1187,13 @@ def scenario_clinic_lookup() -> None:
     assert not CALLS, "a lookup places no calls"
     print("\nOK: Maps field mapping, every drop rule (closed / no phone / no ZIP / "
           "non-US / off-category / duplicate), schema validation, the dump file, "
-          "and an honest empty result on a missing token -- no synthetic fallback.")
-
-
-def scenario_roster_load() -> None:
-    """The seeded interpreter roster: a TEST FIXTURE only (see
-    interpreter_matching.load_candidates_within_radius()'s docstring --
-    nothing in a live run reads this file anymore), 29 synthetic records,
-    14 in Las Vegas, loaded and bounded by travel distance from the MATCHED
-    clinic's ZIP."""
-    _reset()
-    roster = interpreter_matching._roster()
-    assert len(roster) == 29, f"expected 29 interpreters, got {len(roster)}"
-    vegas = [r for r in roster if r["city"] == "Las Vegas"]
-    assert len(vegas) == 14, f"expected 14 in Las Vegas, got {len(vegas)}"
-    assert all(set(r) >= {"name", "age", "phone_number", "zipcode", "expertise"} for r in roster)
-    # The invariant that matters is "no roster number can ring a stranger".
-    # Two ways to satisfy it: a number in the 555-0100..0199 block reserved for
-    # fiction, or one of the operator's own demo test lines (the roster was
-    # edited to use those directly, so a live rehearsal rings a phone the
-    # operator is holding).
-    def _safe_number(number: str) -> bool:
-        reserved = number[5:8] == "555" and number[8:].isdigit() and 100 <= int(number[8:]) <= 199
-        return reserved or number in calle_run.DEMO_TEST_LINES
-
-    assert all(_safe_number(r["phone_number"]) for r in roster), (
-        "BUG: a roster number is neither in the reserved 555-01xx fictional "
-        "block nor one of the operator's own test lines -- it could ring a "
-        "real, unrelated person."
-    )
-
-    near_vegas = interpreter_matching.load_candidates_within_radius("89101", 15.0)
-    assert near_vegas, "Las Vegas should have candidates within 15 miles"
-    assert all(c.distance_miles is not None and c.distance_miles <= 15.0 for c in near_vegas)
-    assert [c.distance_miles for c in near_vegas] == sorted(c.distance_miles for c in near_vegas), (
-        "candidates must come back nearest-first"
-    )
-    assert not any(c.city in ("Reno", "Sparks", "Elko", "Carson City") for c in near_vegas), (
-        "BUG: a northern-Nevada interpreter slipped through a 15-mile Vegas radius"
-    )
-    assert all(c.rate_per_hour is None for c in near_vegas), (
-        "rates are asked on the call, never stored in the roster"
-    )
-    assert near_vegas[0].expertise, "expertise is carried through (stored, not filtered on)"
-
-    fresh = interpreter_matching.load_candidates_within_radius("89101", 15.0)
-    near_vegas[0].rate_per_hour = 999.0
-    assert fresh[0].rate_per_hour is None and (
-        interpreter_matching.load_candidates_within_radius("89101", 15.0)[0].rate_per_hour is None
-    ), "BUG: the roster cache handed back a candidate dirtied by a previous run"
-
-    remote = interpreter_matching.load_candidates_within_radius("89801", 1.0)  # Elko, tight radius
-    assert len(remote) <= 1, f"a tight remote radius should be nearly empty, got {len(remote)}"
-    assert not CALLS, "loading the roster places no calls"
-    print("\nOK: 30 synthetic records, 15 in Las Vegas, fictional-block numbers, "
-          "radius-bounded nearest-first loading, and no cross-run contamination.")
+          "and an empty result on a missing token.")
 
 
 def scenario_il_interpreter_lookup() -> None:
-    """The live Illinois interpreter source's pure parsing and county/region
-    tiering, against canned directory rows -- no network. The live fetch
-    itself (interpreter_lookup._fetch_directory) is monkeypatched out, same
-    spirit as clinic_lookup's canned-items test: the HTTP call is somebody
-    else's problem (httpx is pinned and used identically to the Apify path),
-    what this build owns is correctly reading what comes back."""
+    """The Illinois interpreter source's parsing and county/region tiering
+    against canned directory rows. The HTTP fetch is monkeypatched out, so no
+    network is used."""
     _reset()
 
     assert interpreter_lookup.is_illinois_zip("60601"), "Chicago is in the IL centroid table"
@@ -1271,10 +1208,8 @@ def scenario_il_interpreter_lookup() -> None:
         return [name, "Somewhere, Illinois", county, region, "General-Advanced", status,
                 "No", "<a href='mailto:x@example.com'>x@example.com</a>", phone_cell, "", "No"]
 
-    # IDHHC's own rows pair Cook county with a region ALSO called "Cook" (see
-    # the live sample captured during research) -- kept the same way here so
-    # a Cook-county clinic's region comes from the rows themselves, not a
-    # hardcoded assumption.
+    # The real directory pairs Cook county with a region also named "Cook"; kept
+    # the same here so the clinic's region is read from the rows themselves.
     canned_rows = [
         _row("Cook Match", "Cook", "Cook", "Active", "7735550101"),        # tier 1: same county
         _row("Region Match", "DuPage", "Cook", "Active", "6305550102"),    # tier 2: same region, other county
@@ -1327,93 +1262,97 @@ def scenario_il_interpreter_lookup() -> None:
 
 
 def scenario_call_routing() -> None:
-    """REAL-mode dialling is restricted to the three owned test lines. Tested
-    through the pure resolver, because this process is permanently mock
-    (MOCK_MODE is bound at import in calle/__init__.py)."""
+    """Real-mode dialling is restricted to the numbers in SIGNCALL_TEST_LINES.
+    Tested through the pure resolver, because this process is permanently in
+    mock mode."""
     _reset()
-    lines = calle_run.DEMO_TEST_LINES
-    assert len(lines) == 3
-
-    calle_run.reset_call_routing()
-    clinic_a, clinic_b, clinic_c = "+17025551001", "+17025551002", "+17025551003"
-    assert calle_run.resolve_dial_target(clinic_a, 0) == lines[0]
-    assert calle_run.resolve_dial_target(clinic_b, 1) == lines[1]
-    assert calle_run.resolve_dial_target(clinic_c, 2) == lines[2]
-    # Stickiness: the clinic searched on line 2 is booked on line 2, even
-    # though the booking call passes no position at all.
-    assert calle_run.resolve_dial_target(clinic_b) == lines[1]
-    assert calle_run.resolve_dial_target(clinic_b, 0) == lines[1], (
-        "BUG: a later position overrode an existing assignment"
-    )
-    # Batch positions wrap, and are shared across groups -- freelancer #2 and
-    # clinic #2 both land on line 2. They're sequential calls, so only one
-    # phone rings at a time.
-    assert calle_run.resolve_dial_target("+17025553002", 4) == lines[1]
-
-    for logical in (clinic_a, clinic_b, clinic_c):
-        assert calle_run.resolve_dial_target(logical) in lines
-        assert calle_run.resolve_dial_target(logical) != logical, (
-            "BUG: a logical recipient number was returned as a dial target"
-        )
-
+    lines = ("+15555550101", "+15555550102", "+15555550103")
+    saved = os.environ.get(calle_run.TEST_LINES_ENV)
+    os.environ[calle_run.TEST_LINES_ENV] = ", ".join(lines)
     try:
-        calle_run.resolve_dial_target("+17025559998")
-    except calle_run.CallRoutingError:
-        pass
-    else:
-        raise AssertionError(
-            "BUG: an unassigned recipient with no batch_position silently got a "
-            "line instead of raising -- that's how this invariant rots."
+        calle_run.reset_call_routing()
+        clinic_a, clinic_b, clinic_c = "+17025551001", "+17025551002", "+17025551003"
+        assert calle_run.test_lines() == lines
+        assert calle_run.resolve_dial_target(clinic_a, 0) == lines[0]
+        assert calle_run.resolve_dial_target(clinic_b, 1) == lines[1]
+        assert calle_run.resolve_dial_target(clinic_c, 2) == lines[2]
+        # Sticky: the clinic searched on line 2 is booked on line 2, even though
+        # the booking call passes no position.
+        assert calle_run.resolve_dial_target(clinic_b) == lines[1]
+        assert calle_run.resolve_dial_target(clinic_b, 0) == lines[1], (
+            "BUG: a later position overrode an existing assignment"
+        )
+        # Positions wrap around the configured lines.
+        assert calle_run.resolve_dial_target("+17025553002", 4) == lines[1]
+
+        for logical in (clinic_a, clinic_b, clinic_c):
+            assert calle_run.resolve_dial_target(logical) in lines
+            assert calle_run.resolve_dial_target(logical) != logical, (
+                "BUG: a logical recipient number was returned as a dial target"
+            )
+
+        try:
+            calle_run.resolve_dial_target("+17025559998")
+        except calle_run.CallRoutingError:
+            pass
+        else:
+            raise AssertionError(
+                "BUG: an unassigned recipient with no batch_position silently got a line"
+            )
+
+        calle_run.reset_call_routing()
+        assert calle_run.resolve_dial_target(clinic_b, 2) == lines[2], (
+            "BUG: assignments survived a reset and would leak between runs"
         )
 
-    calle_run.reset_call_routing()
-    assert calle_run.resolve_dial_target(clinic_b, 2) == lines[2], (
-        "BUG: assignments survived a reset and would leak between runs"
-    )
-    # A family call dials the family member's own number, exactly as entered
-    # in the profile -- both the availability ask and the later binding
-    # confirm. Clinics and interpreters never dial directly.
-    sister = "+17025550123"
-    for purpose in (CallPurpose.FAMILY_AVAILABILITY, CallPurpose.FAMILY_CONFIRM):
-        assert calle_run.resolve_call_target(sister, purpose, 0) == sister, (
-            f"BUG: a {purpose.value} call did not dial the family member directly"
-        )
-    for purpose in (CallPurpose.CLINIC_SEARCH, CallPurpose.CLINIC_BOOK,
-                    CallPurpose.INTERPRETER_AVAILABILITY, CallPurpose.INTERPRETER_CONFIRM):
-        assert calle_run.resolve_call_target(sister, purpose, 0) in lines, (
-            f"BUG: a {purpose.value} call dialled a number directly"
-        )
-    # Parallel batches: one number can't take two calls at once, so the same
-    # number shares a lock (its calls queue) and different numbers don't.
-    assert calle_run._dial_lock(lines[0]) is calle_run._dial_lock(lines[0])
-    assert calle_run._dial_lock(lines[0]) is not calle_run._dial_lock(lines[1])
+        # Family calls dial the number the user entered; everything else goes to a test line.
+        sister = "+17025550123"
+        for purpose in (CallPurpose.FAMILY_AVAILABILITY, CallPurpose.FAMILY_CONFIRM,
+                        CallPurpose.FAMILY_RELEASE):
+            assert calle_run.resolve_call_target(sister, purpose, 0) == sister, (
+                f"BUG: a {purpose.value} call did not dial the family member directly"
+            )
+        for purpose in (CallPurpose.CLINIC_SEARCH, CallPurpose.CLINIC_BOOK, CallPurpose.CLINIC_CANCEL,
+                        CallPurpose.INTERPRETER_AVAILABILITY, CallPurpose.INTERPRETER_CONFIRM,
+                        CallPurpose.INTERPRETER_RELEASE):
+            assert calle_run.resolve_call_target(sister, purpose, 0) in lines, (
+                f"BUG: a {purpose.value} call dialled a number directly"
+            )
+
+        # One phone can't take two calls at once: the same number shares a lock,
+        # different numbers don't.
+        assert calle_run._dial_lock(lines[0]) is calle_run._dial_lock(lines[0])
+        assert calle_run._dial_lock(lines[0]) is not calle_run._dial_lock(lines[1])
+
+        # No configured lines, or a malformed entry, must refuse rather than guess.
+        calle_run.reset_call_routing()
+        for bad in ("", "5555550101", "+1 not a number"):
+            os.environ[calle_run.TEST_LINES_ENV] = bad
+            try:
+                calle_run.resolve_dial_target("+17025557777", 0)
+            except calle_run.CallRoutingError:
+                pass
+            else:
+                raise AssertionError(f"BUG: {bad!r} was accepted as a test-line setting")
+    finally:
+        if saved is None:
+            os.environ.pop(calle_run.TEST_LINES_ENV, None)
+        else:
+            os.environ[calle_run.TEST_LINES_ENV] = saved
+        calle_run.reset_call_routing()
     assert not CALLS
-    print(f"\nOK: real-mode dialling resolves only to {', '.join(lines)}, "
-          "stickily per recipient, and refuses to guess.")
+    print("\nOK: real-mode dialling resolves only to the configured test lines, "
+          "stickily per recipient, and refuses when they are missing or malformed.")
 
 
 def scenario_api_endpoint() -> None:
-    """The HTTP endpoint the frontend POSTs to, exercised in-process with
-    FastAPI's TestClient -- no server, no network, no calls.
-
-    There's no synthetic fallback anymore for either leg (see clinic_lookup.py
-    and appointment.py::_resolve_freelance_pool() -- an honest empty result
-    beats a fabricated one), so this scenario runs its happy path against an
-    ILLINOIS ZIP and mocks the two live TRANSPORTS directly instead:
-    clinic_lookup.fetch_places() (so find_clinics() still runs its real
-    filtering/sorting code against controlled data, not a live Apify call)
-    and interpreter_lookup._fetch_directory() (same reasoning, for
-    find_interpreters_il()). That's a closer simulation of a genuinely
-    successful live run than the old Nevada-fallback path ever was. The API
-    is imported HERE rather than at module scope: importing it sets no
-    default mock (registration is per-run), but keeping the import local also
-    keeps the other scenarios' deliberately-unmocked tripwires obviously
-    untouched.
-    """
+    """The HTTP endpoint the frontend POSTs to, driven in-process with FastAPI's
+    TestClient. The two live transports (Apify clinic search, IDHHC directory)
+    are mocked so the real filtering and ranking code runs on controlled data."""
     _reset()
     os.environ["CALLE_MOCK_MODE"] = "1"
     os.environ["SIGNCALL_API_DEMO_MOCKS"] = "1"
-    il_zip = "60616"  # Chicago, Cook county -- see module docstring above
+    il_zip = "60616"  # Chicago, Cook county
 
     saved_token = os.environ.get("APIFY_API_TOKEN")
     os.environ["APIFY_API_TOKEN"] = "test-token"  # present, but fetch_places() below never reads it
@@ -1633,6 +1572,22 @@ def scenario_api_endpoint() -> None:
         assert confirm(run_id, True).status_code == 409, "a late answer must be refused"
         server.CONFIRM_TIMEOUT_SECONDS = real_timeout
 
+        # 7. Nobody to book (no clinic found) ends as a clean "declined" with a
+        #    plain message the frontend can show as-is -- not a "failed" run.
+        mocked_fetch = clinic_lookup.fetch_places
+        clinic_lookup.fetch_places = lambda zipcode, appointment_type, token: []
+        try:
+            _reset()
+            events.clear()
+            run_id = start_run()["run_id"]
+            status = wait_for(run_id, "succeeded", "failed", "declined")
+        finally:
+            clinic_lookup.fetch_places = mocked_fetch
+        assert status["status"] == "declined", status
+        assert "couldn't find any dental clinics" in status["reason"], status["reason"]
+        assert not CALLS, "no clinic found means no call was placed"
+        assert events[-1]["event"] == "run_finished" and events[-1]["status"] == "declined"
+
         assert client.get("/runs/not-a-real-id").status_code == 404
         assert confirm("not-a-real-id", True).status_code == 404
     finally:
@@ -1668,6 +1623,8 @@ SCENARIOS = {
     "family_locks_in": scenario_family_locks_in,
     "family_confirm_fallback": scenario_family_confirm_fallback,
     "clinic_search_exhausted": scenario_clinic_search_exhausted,
+    "no_interpreter_available": scenario_no_interpreter_available,
+    "call_scripts": scenario_call_scripts,
     "requirements": scenario_requirements,
     "clinic_alternate_date_rejected": scenario_clinic_alternate_date_rejected,
     "freelance_parallel": scenario_freelance_parallel,
@@ -1676,7 +1633,6 @@ SCENARIOS = {
     "interpreters_all_decline": scenario_interpreters_all_decline,
     "input_validation": scenario_input_validation,
     "clinic_lookup": scenario_clinic_lookup,
-    "roster_load": scenario_roster_load,
     "il_interpreter_lookup": scenario_il_interpreter_lookup,
     "call_routing": scenario_call_routing,
     "api_endpoint": scenario_api_endpoint,

@@ -1,36 +1,17 @@
 """
-FastAPI server: wraps infer.predict() behind an HTTP endpoint AND serves the
-minimal camera UI (static/index.html) from the same process, so there's only
-one thing to run for the whole demo.
+FastAPI server for the ASL booking app. It serves the camera UI (static/), a
+WebSocket that turns camera frames into signed words, the Gemini-backed parsing
+endpoints, the profile and booking storage, and the hand-off to the signcall
+workflow server.
 
-This is the integration seam: your model work (Colab) and the UI work can now
-proceed independently. The UI only needs to know one contract -- POST a
-video, get back predicted words -- regardless of what changes on the model
-side later (baseline -> gru, vocab changes, retraining, etc.).
+    uvicorn app:app --host 127.0.0.1 --port 8000
 
-Run this wherever the trained checkpoint + label_map.json live:
-
-    pip install fastapi uvicorn python-multipart
-    uvicorn app:app --host 0.0.0.0 --port 8000
-
-Then open http://localhost:8000/ for the camera UI, or call the API directly:
-    POST /predict   (multipart/form-data, field name "video", a video file)
-    -> {"predictions": [{"word": "doctor", "confidence": 0.83}, ...]}
-
-If you're running this inside Colab for the demo (simplest option under time
-pressure), expose it with a tunnel so it's reachable from a real browser
-(Colab's own environment has no camera), e.g.:
-    !npx localtunnel --port 8000
-or ngrok, if your team already has it set up. getUserMedia (camera access)
-requires either localhost or https -- a plain http tunnel URL will NOT let
-the browser grant camera access, so make sure whatever tunnel you use serves
-https (localtunnel and ngrok both do by default).
+Run it from this folder: model, label map and static paths are relative. The
+browser only grants camera access on localhost or https.
 """
 import json
 import os
 import re
-import shutil
-import tempfile
 import urllib.error
 import urllib.request
 from datetime import date
@@ -45,27 +26,22 @@ from fastapi.staticfiles import StaticFiles
 
 import db
 from gemini_client import extract_card_fields, parse_booking_transcript
-from infer import classify_features, predict
+from infer import DEFAULT_CHECKPOINT, DEFAULT_LABEL_MAP, classify_features
 from segmenter import SignSegmenter
 from utils_landmarks import Landmarkers
 
-# Settings live in asl-recognition/.env (see .env.example), read from this
-# file's own folder so it doesn't matter where the server is started from.
-# Variables already set in the shell win over the file.
+# Settings come from asl-recognition/.env (see .env.example); variables already
+# set in the shell win.
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-# Where the completed booking request is forwarded -- the clinic/interpreter
-# matching workflow (calling clinics, checking interpreter availability,
-# confirming and calendaring) lives entirely outside this app; set this to
-# that workflow's intake endpoint.
+# The signcall workflow's POST /runs endpoint, where booking requests are sent.
 BOOKING_WORKFLOW_URL = os.environ.get("BOOKING_WORKFLOW_URL", "")
 
-# Must match the workflow's JSON schema exactly -- see submit_booking_endpoint().
 WEEKDAY_NAMES = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
 app = FastAPI(title="ASL-to-text inference + booking app")
 
-# Wide open for hackathon speed. Tighten this if it ever runs anywhere but a demo.
+# Open CORS and no authentication: this is a local demo, not a deployable service.
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
@@ -75,56 +51,25 @@ app.add_middleware(
 def _startup():
     db.init_db()
 
-# Change to "baseline" if that's the checkpoint you actually have saved --
-# whatever you trained and downloaded, this must match its filename.
-MODEL_NAME = "gru"
-CHECKPOINT = f"model_{MODEL_NAME}_best.pt"
-LABEL_MAP = "label_map.json"
+
+CHECKPOINT = DEFAULT_CHECKPOINT
+LABEL_MAP = DEFAULT_LABEL_MAP
 
 
 @app.get("/health")
 def health():
     return {
         "status": "ok" if Path(CHECKPOINT).exists() else "missing_checkpoint",
-        "model": MODEL_NAME,
         "checkpoint": CHECKPOINT,
     }
 
 
-@app.post("/predict")
-async def predict_endpoint(video: UploadFile = File(...), topk: int = 3):
-    if not Path(CHECKPOINT).exists():
-        raise HTTPException(500, f"checkpoint not found: {CHECKPOINT} (wrong MODEL_NAME, or file not uploaded here?)")
-    if not Path(LABEL_MAP).exists():
-        raise HTTPException(500, f"label map not found: {LABEL_MAP}")
-
-    suffix = Path(video.filename or "").suffix or ".mp4"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        shutil.copyfileobj(video.file, tmp)
-        tmp_path = tmp.name
-
-    try:
-        results = predict(tmp_path, model_name=MODEL_NAME, checkpoint=CHECKPOINT,
-                           label_map_path=LABEL_MAP, topk=topk)
-    except Exception as e:
-        raise HTTPException(500, f"inference failed: {e}")
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
-
-    return {"predictions": [{"word": w, "confidence": p} for w, p in results]}
-
-
 @app.websocket("/ws/stream")
 async def stream_endpoint(websocket: WebSocket):
-    """The real UI's data path: the browser sends one JPEG frame at a time,
-    continuously, for as long as the camera is on. This holds a Landmarkers
-    + SignSegmenter per connection, and pushes a message back the instant it
-    has something to say -- a status change (signing started/stopped, purely
-    for the UI's live visual indicator) or a classified word.
+    """Live sign recognition. The browser sends one JPEG frame per binary
+    message; each connection owns its own Landmarkers and SignSegmenter.
 
-    Protocol:
-      client -> server: binary WebSocket messages, each one JPEG-encoded frame
-      server -> client: JSON messages,
+      server -> client (JSON):
         {"type": "status", "signing": true|false}
         {"type": "word", "word": "...", "confidence": 0.0-1.0}
         {"type": "error", "message": "..."}
@@ -145,7 +90,7 @@ async def stream_endpoint(websocket: WebSocket):
             data = await websocket.receive_bytes()
             frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
             if frame is None:
-                continue  # corrupt/partial frame -- skip it, don't kill the connection over one bad frame
+                continue  # skip a corrupt frame rather than drop the connection
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             feat = landmarkers.process_frame(rgb)
@@ -158,8 +103,8 @@ async def stream_endpoint(websocket: WebSocket):
 
             if segment is not None:
                 try:
-                    results = classify_features(segment, model_name=MODEL_NAME,
-                                                 checkpoint=CHECKPOINT, label_map_path=LABEL_MAP, topk=1)
+                    results = classify_features(segment, checkpoint=CHECKPOINT,
+                                                label_map_path=LABEL_MAP, topk=1)
                 except Exception as e:
                     await websocket.send_json({"type": "error", "message": f"inference failed: {e}"})
                     continue
@@ -175,11 +120,8 @@ async def stream_endpoint(websocket: WebSocket):
 @app.post("/extract-card")
 async def extract_card_endpoint(image: UploadFile = File(...)):
     """One ID or insurance card photo in, best-effort structured fields out.
-    Called twice by the frontend (once per card) during profile setup. Never
-    guesses a field that isn't visible on that specific card -- see the
-    prompt in gemini_client.py -- so a mostly-empty result back is expected
-    and normal, not a bug; the verify screen right after this is where the
-    user fills in whatever didn't come through."""
+    Fields not visible on the card come back empty; the user fills them in on
+    the verify screen."""
     if not os.environ.get("GEMINI_API_KEY"):
         raise HTTPException(500, "GEMINI_API_KEY is not set on the server")
     image_bytes = await image.read()
@@ -193,10 +135,8 @@ async def extract_card_endpoint(image: UploadFile = File(...)):
 
 @app.post("/parse-booking")
 async def parse_booking_endpoint(payload: dict = Body(...)):
-    """Confirmed sign/typed transcript in, structured availability out. Today's
-    real date is injected server-side (never trust a client-supplied date for
-    this) so "Tuesday" resolves to an actual calendar date the confirm screen
-    can show the user for a sanity check before anything is booked."""
+    """Confirmed transcript in, structured availability out. Today's date is
+    injected server-side so "Tuesday" resolves to a real calendar date."""
     if not os.environ.get("GEMINI_API_KEY"):
         raise HTTPException(500, "GEMINI_API_KEY is not set on the server")
     transcript = (payload or {}).get("transcript", "").strip()
@@ -214,26 +154,21 @@ async def parse_booking_endpoint(payload: dict = Body(...)):
 
 @app.get("/profile/{user_id}")
 def get_profile_endpoint(user_id: str = PathParam(...)):
-    """Returns null fields (not a 404) for an unknown user_id -- the frontend
-    treats 'no profile yet' as the normal first-visit case, not an error."""
+    """An unknown user_id is a normal first visit, so it returns exists=false, not a 404."""
     profile = db.get_profile(user_id)
     return {"exists": profile is not None, "profile": profile}
 
 
 @app.post("/profile/{user_id}")
 def save_profile_endpoint(user_id: str = PathParam(...), profile: dict = Body(...)):
-    """Upsert -- called once after profile+family verification, and again any
-    time the user chooses to edit their saved profile later. Fields not
-    provided are left as null/empty; the frontend always sends the full
-    profile object it's currently holding, never a partial patch."""
+    """Upsert of the full profile object (never a partial patch)."""
     db.save_profile(user_id, profile)
     return {"status": "saved"}
 
 
 def _format_phone_e164(raw: str, *, who: str) -> str:
-    """'(555) 123-4567' / '555-123-4567' / '15551234567' -> '+15551234567'.
-    Raises with a message naming which field was bad, not just that
-    something was -- the frontend surfaces this string straight to the user."""
+    """'(555) 123-4567' / '15551234567' -> '+15551234567'. The error names the
+    bad field because the frontend shows it to the user as is."""
     digits = re.sub(r"\D", "", raw or "")
     if len(digits) == 11 and digits.startswith("1"):
         digits = digits[1:]
@@ -243,9 +178,7 @@ def _format_phone_e164(raw: str, *, who: str) -> str:
 
 
 def _format_time_12h(hhmm: str) -> str:
-    """'14:00' -> '2PM', '16:30' -> '4:30PM' -- the 24h HH:MM values our own
-    <input type=time"> and Gemini both produce, reshaped into the workflow's
-    '2PM' / '4:30PM' pattern."""
+    """'14:00' -> '2PM', '16:30' -> '4:30PM' (the workflow's time format)."""
     try:
         h, m = hhmm.split(":")
         h, m = int(h), int(m)
@@ -258,9 +191,7 @@ def _format_time_12h(hhmm: str) -> str:
 
 
 def _weekday_name(date_str: str) -> str:
-    """Always recompute the weekday from the actual date rather than trust
-    whatever display label the frontend or Gemini attached to it -- that
-    label is decorative UI text (e.g. "Tuesday, Sep 15"), not validated data."""
+    """Recomputed from the date; display labels from the client are not trusted."""
     try:
         return WEEKDAY_NAMES[date.fromisoformat(date_str).weekday()]
     except ValueError:
@@ -269,11 +200,9 @@ def _weekday_name(date_str: str) -> str:
 
 @app.post("/submit-booking")
 def submit_booking_endpoint(payload: dict = Body(...)):
-    """Takes the confirm screen's payload (our own internal field names),
-    reshapes it into the exact JSON schema the booking workflow expects, and
-    forwards it there over HTTP. The request itself isn't kept -- only the
-    run's id and progress, so the confirmation and outcome screens can find
-    it again (see db.py's bookings table and the /bookings endpoints)."""
+    """Reshapes the confirm screen's payload into the signcall workflow's input
+    schema and starts a run. Only the run id and its progress are stored, not
+    the request."""
     if not BOOKING_WORKFLOW_URL:
         raise HTTPException(500, "BOOKING_WORKFLOW_URL is not set on the server")
 
@@ -328,10 +257,6 @@ def submit_booking_endpoint(payload: dict = Body(...)):
         except (KeyError, ValueError) as e:
             raise HTTPException(400, str(e))
 
-    # BOOKING_WORKFLOW_URL must point at POST /runs specifically (not just the
-    # host:port) -- that's the one endpoint on the workflow's server that
-    # accepts this JSON body. It returns 202 with a run_id THE WORKFLOW
-    # generates; we never send one ourselves, only get one back.
     body = json.dumps(workflow_payload).encode("utf-8")
     req = urllib.request.Request(
         BOOKING_WORKFLOW_URL, data=body, method="POST",
@@ -347,9 +272,7 @@ def submit_booking_endpoint(payload: dict = Body(...)):
         except (json.JSONDecodeError, AttributeError):
             reason = raw
         if e.code == 409:
-            # The workflow runs one booking at a time by design (overlapping
-            # runs would place overlapping real phone calls) -- this is an
-            # expected, retryable state, not a bug.
+            # The workflow runs one booking at a time; this is retryable.
             raise HTTPException(409, f"A booking is already being processed by the workflow -- try again shortly. ({reason})")
         raise HTTPException(502, f"booking workflow rejected the request ({e.code}): {reason}"[:400])
     except urllib.error.URLError as e:
@@ -360,15 +283,11 @@ def submit_booking_endpoint(payload: dict = Body(...)):
     except json.JSONDecodeError:
         return {"status": "sent", "workflow_response": resp_body[:2000]}
 
-    # Tie the run to this browser. The workflow reports progress by run id
-    # alone, and the browser only ever asks for runs it owns.
+    # The workflow reports by run id alone, so tie the run to this browser.
     if run.get("run_id"):
         db.register_booking(run["run_id"], payload["user_id"])
 
-    # run_id/plan flow straight back to the confirm screen's result: the plan
-    # text is the informed-consent disclosure for the search (nothing is
-    # booked until the user approves a proposal later), so it needs to reach
-    # the user, not just get logged here.
+    # `plan` is the consent disclosure for the search; it must reach the user.
     return {
         "status": "sent",
         "run_id": run.get("run_id"),
@@ -379,14 +298,13 @@ def submit_booking_endpoint(payload: dict = Body(...)):
 
 
 def _workflow_url(*parts: str) -> str:
-    """BOOKING_WORKFLOW_URL is the workflow's POST /runs; a run's own
-    endpoints hang off it."""
+    """A run's own endpoints hang off BOOKING_WORKFLOW_URL (POST /runs)."""
     return "/".join([BOOKING_WORKFLOW_URL.rstrip("/"), *parts])
 
 
 def _booking_for(run_id: str, user_id) -> dict:
-    """The booking, if it exists AND belongs to this browser. Anything else is
-    the same 404, so a run id on its own reveals nothing."""
+    """The booking if it belongs to this browser; otherwise the same 404, so a
+    run id alone reveals nothing."""
     booking = db.get_booking(run_id)
     if booking is None or not user_id or booking["user_id"] != user_id:
         raise HTTPException(404, "No such booking.")
@@ -394,11 +312,9 @@ def _booking_for(run_id: str, user_id) -> dict:
 
 
 def _sync_from_workflow(booking: dict) -> dict:
-    """Notifications are how this server normally learns a run's state, but
-    they can be lost: the workflow was started without SIGNCALL_NOTIFY_URL, or
-    this server was down when one was sent. While a run is unfinished, ask the
-    workflow directly, so a lost notification can't leave the page waiting
-    forever. Best effort -- any failure just leaves the stored state as it is."""
+    """Notifications normally update a run, but one can be lost (no
+    SIGNCALL_NOTIFY_URL, or this server was down). For an unfinished run, ask
+    the workflow directly. Best effort: any failure keeps the stored state."""
     if booking["status"] not in ("running", "awaiting_confirmation", "cancelling") or not BOOKING_WORKFLOW_URL:
         return booking
     try:
@@ -427,10 +343,8 @@ def _sync_from_workflow(booking: dict) -> dict:
 
 @app.post("/notifications")
 def receive_notification_endpoint(payload: dict = Body(...)):
-    """Where the booking workflow delivers its events (its SIGNCALL_NOTIFY_URL
-    points here). This is the "notification" to the user: it is stored, and
-    the open browser page shows it. There are no accounts yet, so it can't
-    be a text or email -- and, for the same reason, nothing authenticates the
+    """Receives the workflow's events (its SIGNCALL_NOTIFY_URL points here).
+    They are stored and shown by the open page. Nothing authenticates the
     sender beyond the run id being unguessable.
 
     Events, from the workflow's api/notify.py:
@@ -467,9 +381,8 @@ def receive_notification_endpoint(payload: dict = Body(...)):
 
 @app.get("/bookings/{run_id}")
 def get_booking_endpoint(run_id: str, user_id: str = Query(...)):
-    """What the progress / confirm / outcome screens poll. `status` is one of
-    running, awaiting_confirmation, succeeded, declined, failed, and -- once a
-    succeeded booking's own cancel button has been used -- cancelling,
+    """What the progress, confirm and outcome screens poll. `status` is one of
+    running, awaiting_confirmation, succeeded, declined, failed, cancelling,
     cancelled, cancel_failed."""
     booking = _sync_from_workflow(_booking_for(run_id, user_id))
     return {
@@ -480,8 +393,7 @@ def get_booking_endpoint(run_id: str, user_id: str = Query(...)):
 
 @app.post("/bookings/{run_id}/confirm")
 def confirm_booking_endpoint(run_id: str, payload: dict = Body(...)):
-    """The user's yes or no to the proposal on screen. Forwarded to the
-    workflow, which is waiting on it; nothing is booked before this."""
+    """The user's yes or no to the proposal; nothing is booked before this."""
     approved = payload.get("approved")
     if not isinstance(approved, bool):
         raise HTTPException(400, "approved must be true or false")
@@ -500,7 +412,7 @@ def confirm_booking_endpoint(run_id: str, payload: dict = Body(...)):
             pass
     except urllib.error.HTTPError as e:
         if e.code == 409:
-            # Answered already, or the workflow gave up waiting and ended it.
+            # Already answered, or the workflow timed out waiting.
             raise HTTPException(409, "This request is no longer waiting for your answer -- it may have timed out.")
         raise HTTPException(502, f"booking workflow rejected your answer ({e.code})")
     except urllib.error.URLError as e:
@@ -512,21 +424,10 @@ def confirm_booking_endpoint(run_id: str, payload: dict = Body(...)):
 
 @app.post("/bookings/{run_id}/cancel")
 def cancel_booking_endpoint(run_id: str, payload: dict = Body(...)):
-    """The user cancelling an already-booked appointment -- from the outcome
-    screen right after booking, or from the booking-history list days later.
-    Forwarded to the workflow, which places the real cancel/release calls;
-    the frontend then polls the same GET /bookings/{run_id} it already uses,
-    watching for status to move on from 'cancelling'.
-
-    The workflow server keeps no durable storage of its own (see its
-    README/server.py docstring) -- a cancel request days after booking would
-    otherwise 404 against a process that's since restarted and forgotten the
-    run. So this sends the booking's own stored `result` (clinic contact,
-    interpreter, slot -- exactly what /submit-booking's outcome already gave
-    us) and the patient's name (from their profile, since bookings.py itself
-    never stores a name -- see db.py's module docstring) in the request
-    body. The workflow uses this to "adopt" the run if it doesn't already
-    know it, or prefers it over its own (possibly staler) copy if it does."""
+    """Cancels a booked appointment, from the outcome screen or the upcoming
+    list. The workflow keeps runs in memory only, so the stored `result` and
+    the patient's name are sent along for it to adopt the run if it has
+    forgotten it. The frontend then polls GET /bookings/{run_id}."""
     user_id = payload.get("user_id")
     booking = _booking_for(run_id, user_id)
     if booking["status"] not in ("succeeded", "cancel_failed"):
@@ -560,22 +461,37 @@ def cancel_booking_endpoint(run_id: str, payload: dict = Body(...)):
     return {"status": "cancelling"}
 
 
-@app.get("/bookings")
-def list_bookings_endpoint(user_id: str = Query(...)):
-    """The booking-history view: every booking this browser has ever
-    submitted, most recent first. Unlike GET /bookings/{run_id}, this never
-    live-syncs from the workflow -- only the one run actively being tracked
-    needs that; a history list is read from what's already stored."""
-    bookings = db.list_bookings(user_id)
-    return {
-        "bookings": [
-            {key: booking[key] for key in
-             ("run_id", "status", "proposal", "result", "error", "reason", "cancellation", "updated_at")}
-            for booking in bookings
-        ]
-    }
+@app.get("/appointments/upcoming")
+def list_upcoming_endpoint(user_id: str = Query(...)):
+    """This browser's booked future appointments, soonest first, read from
+    storage without syncing. Only what the list shows plus the run_id the
+    cancel button needs; the cancel endpoint reads the full result itself."""
+    appointments = []
+    for booking in db.list_upcoming(user_id):
+        result = booking["result"]
+        contact = result.get("clinic_contact") or {}
+        interpreter = result.get("interpreter") or {}
+        appointments.append({
+            "run_id": booking["run_id"],
+            "date": result["appointment_slot"]["date"],
+            "time": result["appointment_slot"]["time"],
+            "clinic": contact.get("name"),
+            "address": contact.get("address"),
+            "zipcode": contact.get("zipcode"),
+            "interpreter": {k: interpreter.get(k) for k in ("tier", "name", "relation")},
+        })
+    return {"appointments": appointments}
 
 
-# Serves static/index.html at GET / (and any other file under static/).
+class RevalidatingStaticFiles(StaticFiles):
+    """`no-cache` makes the browser revalidate on each load, so a stale
+    index.html is never paired with a newer app.js."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 # Mounted last so it doesn't shadow the routes above.
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+app.mount("/", RevalidatingStaticFiles(directory="static", html=True), name="static")

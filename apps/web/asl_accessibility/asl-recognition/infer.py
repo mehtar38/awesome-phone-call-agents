@@ -1,24 +1,29 @@
 """
-Run the trained model on a single video file, or (classify_features, used by
-app.py's live streaming endpoint) on an already-extracted landmark sequence.
-This is the function the rest of the call-agent pipeline calls per ASL sign.
+Classifies a sign from landmark features. `classify_features` is what the live
+stream in app.py calls per segmented sign; the command line runs the same model
+on a video file, which is handy for trying a clip without the browser:
 
-Usage:
-    python infer.py --video path/to/clip.mp4 --model gru
-    python infer.py --video path/to/clip.mp4 --model gru --topk 5
+    python infer.py --video path/to/clip.mp4 --topk 5
 """
 import argparse
+import json
 from functools import lru_cache
 
 import cv2
 import numpy as np
 import torch
 
-from dataset import load_label_map
-from models import BiGRUAttention, PooledMLP
+from models import BiGRUAttention
 from utils_landmarks import FEATURE_DIM, Landmarkers, sample_or_pad
 
-SEQ_LEN = 32
+SEQ_LEN = 32  # frames per clip after resampling; must match training
+DEFAULT_CHECKPOINT = "model_gru_best.pt"
+DEFAULT_LABEL_MAP = "label_map.json"
+
+
+def load_label_map(path: str) -> dict:
+    with open(path) as f:
+        return json.load(f)
 
 
 def extract_features_from_video(path: str) -> np.ndarray:
@@ -37,60 +42,42 @@ def extract_features_from_video(path: str) -> np.ndarray:
     return np.stack(feats)
 
 
-def load_model(model_name: str, n_classes: int, checkpoint: str, device):
-    model = PooledMLP(FEATURE_DIM, n_classes) if model_name == "baseline" else BiGRUAttention(FEATURE_DIM, n_classes)
-    model.load_state_dict(torch.load(checkpoint, map_location=device))
-    model.to(device)
-    model.eval()
-    return model
-
-
-@lru_cache(maxsize=4)
-def _load_cached(model_name: str, checkpoint: str, label_map_path: str):
-    """Cached so repeated calls (e.g. one per detected sign in a live stream)
-    don't reload weights from disk every time -- loaded once, reused."""
+@lru_cache(maxsize=2)
+def _load_cached(checkpoint: str, label_map_path: str):
+    """Loaded once and reused, so a live stream doesn't reread the weights per sign."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     label_to_idx = load_label_map(label_map_path)
     idx_to_label = {v: k for k, v in label_to_idx.items()}
-    model = load_model(model_name, len(label_to_idx), checkpoint, device)
+    model = BiGRUAttention(FEATURE_DIM, len(label_to_idx))
+    model.load_state_dict(torch.load(checkpoint, map_location=device))
+    model.to(device).eval()
     return model, idx_to_label, device
 
 
-def classify_features(feats: np.ndarray, model_name: str = "gru", checkpoint: str = None,
-                       label_map_path: str = "label_map.json", topk: int = 3):
-    """Run the trained model on an already-extracted (T, FEATURE_DIM) landmark
-    sequence -- what app.py's live streaming endpoint calls, since it already
-    has per-frame features from Landmarkers and doesn't need to re-extract
-    from a video file the way predict() below does."""
-    checkpoint = checkpoint or f"model_{model_name}_best.pt"
-    model, idx_to_label, device = _load_cached(model_name, checkpoint, label_map_path)
+def classify_features(feats: np.ndarray, checkpoint: str = DEFAULT_CHECKPOINT,
+                      label_map_path: str = DEFAULT_LABEL_MAP, topk: int = 3):
+    """Top-k (label, probability) pairs for one (T, FEATURE_DIM) landmark sequence."""
+    model, idx_to_label, device = _load_cached(checkpoint, label_map_path)
 
     feats = sample_or_pad(feats, SEQ_LEN)
     x = torch.from_numpy(feats).float().unsqueeze(0).to(device)  # (1, T, D)
 
     with torch.no_grad():
-        logits = model(x)
-        probs = torch.softmax(logits, dim=1).squeeze(0)
+        probs = torch.softmax(model(x), dim=1).squeeze(0)
 
     top_probs, top_idx = probs.topk(min(topk, len(idx_to_label)))
     return [(idx_to_label[i.item()], p.item()) for p, i in zip(top_probs, top_idx)]
 
 
-def predict(video_path: str, model_name: str = "gru", checkpoint: str = None,
-            label_map_path: str = "label_map.json", topk: int = 3):
-    feats = extract_features_from_video(video_path)
-    return classify_features(feats, model_name, checkpoint, label_map_path, topk)
-
-
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True)
-    ap.add_argument("--model", choices=["baseline", "gru"], default="gru")
-    ap.add_argument("--checkpoint", default=None)
+    ap.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     ap.add_argument("--topk", type=int, default=3)
     args = ap.parse_args()
 
-    results = predict(args.video, args.model, args.checkpoint, topk=args.topk)
+    results = classify_features(extract_features_from_video(args.video),
+                                checkpoint=args.checkpoint, topk=args.topk)
     print("\nTop predictions:")
     for word, prob in results:
         print(f"  {word:15s} {prob:.3f}")

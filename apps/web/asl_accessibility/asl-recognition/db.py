@@ -1,31 +1,21 @@
 """
-Minimal persistence layer -- SQLite, stdlib only, no ORM. This is a deliberate
-choice given the timeline: a single-file DB needs no separate server, no
-migrations tooling, and ships inside the repo. Swap for Postgres/etc. later
-if this ever needs concurrent multi-instance writes; a hackathon demo won't.
+SQLite persistence (stdlib only). Two things are stored:
 
-There's no login system anywhere in this workflow, so "who is this user"
-is a UUID the browser generates once and stores in localStorage (see
-static/app.js -- getUserId()), sent back on every request. That's enough to
-make a profile persist across visits on the same browser/device without
-building real auth under time pressure. It is NOT multi-device identity --
-flag that as a known limitation if it matters for the submission.
-
-Two things persist here:
-
-  - the profile (identity, insurance, family), and
+  - the profile: identity, insurance and family contacts;
   - one `bookings` row per submitted request: where it is in the workflow, the
-    proposal the user was asked to approve, and how it ended. The workflow
-    reports each of those to /notifications (see app.py), and the browser
-    reads them back from here. This row is also what a cancellation looks
-    appointment details up in: the signcall workflow server keeps no
-    durable storage of its own (see its README), so a cancel request sends
-    this row's own stored `result` (clinic contact, interpreter, slot) back
-    to it, rather than asking it to still remember a run from days ago.
+    proposal the user was asked to approve, and how it ended.
+
+There is no login. A "user" is a UUID the browser generates once and keeps in
+localStorage (static/app.js, getUserId()), sent with every request. That keeps
+a profile across visits on one browser; it is not multi-device identity.
+
+The signcall workflow server keeps runs in memory only, so a cancellation sends
+the booking's stored `result` (clinic contact, interpreter, slot) back to it.
 """
 import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
 DB_PATH = "data/app.db"
@@ -56,19 +46,6 @@ def init_db():
             updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # `phone` and `has_interpreter` were added/removed after this table may
-    # already have been created on disk during earlier testing -- CREATE
-    # TABLE IF NOT EXISTS won't retrofit an existing file, so patch it here.
-    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(profiles)")}
-    if "phone" not in existing_cols:
-        conn.execute("ALTER TABLE profiles ADD COLUMN phone TEXT")
-    # An earlier version kept a `bookings` table with a different shape
-    # (id, user_id, payload_json). CREATE TABLE IF NOT EXISTS would leave it in
-    # place and every write below would fail, so set it aside rather than
-    # delete rows that were saved on purpose.
-    booking_cols = {row["name"] for row in conn.execute("PRAGMA table_info(bookings)")}
-    if booking_cols and "run_id" not in booking_cols:
-        conn.execute("ALTER TABLE bookings RENAME TO bookings_legacy")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
             run_id             TEXT PRIMARY KEY,
@@ -83,11 +60,6 @@ def init_db():
             updated_at         TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # `cancellation_json` was added after this table may already exist on
-    # disk, same reason as the `phone` patch above.
-    booking_cols = {row["name"] for row in conn.execute("PRAGMA table_info(bookings)")}
-    if "cancellation_json" not in booking_cols:
-        conn.execute("ALTER TABLE bookings ADD COLUMN cancellation_json TEXT")
     conn.commit()
     conn.close()
 
@@ -129,9 +101,9 @@ def get_profile(user_id: str):
 # status: running -> awaiting_confirmation -> running -> succeeded | declined | failed
 #         succeeded -> cancelling -> cancelled | cancel_failed (user-initiated only)
 #
-# The workflow's notifications can arrive before /submit-booking has recorded
-# who the run belongs to (a fast run finishes in milliseconds), so every write
-# here is an upsert on run_id that never rolls a run backwards.
+# Workflow notifications can arrive before /submit-booking has recorded who
+# the run belongs to, so every write is an upsert on run_id that never rolls a
+# run backwards.
 
 @contextmanager
 def _transaction():
@@ -179,8 +151,7 @@ def record_outcome(run_id: str, status: str, result=None, error=None, reason=Non
 
 
 def resolve_confirmation(run_id: str, approved: bool):
-    """The user answered. Moves an awaiting run on; leaves a run that has
-    already ended alone."""
+    """The user answered. Only moves a run that is still awaiting an answer."""
     with _transaction() as conn:
         conn.execute("""
             UPDATE bookings SET status=?, updated_at=CURRENT_TIMESTAMP
@@ -189,9 +160,8 @@ def resolve_confirmation(run_id: str, approved: bool):
 
 
 def record_cancelling(run_id: str):
-    """The user asked to cancel a booking; the workflow is placing the
-    cancel/release calls now. Moves a booking that's succeeded, or retrying
-    after a failed cancel attempt -- nothing else has anything to cancel."""
+    """The user asked to cancel; the workflow is placing the cancel calls now.
+    Only a succeeded booking, or one whose earlier cancel failed, can move."""
     with _transaction() as conn:
         conn.execute("""
             UPDATE bookings SET status='cancelling', updated_at=CURRENT_TIMESTAMP
@@ -200,8 +170,7 @@ def record_cancelling(run_id: str):
 
 
 def record_cancellation(run_id: str, status: str, cancellation=None, error=None):
-    """How the cancellation ended: cancelled or cancel_failed. Only moves a
-    booking that's actually cancelling, same reasoning as record_cancelling."""
+    """How the cancellation ended: cancelled or cancel_failed."""
     with _transaction() as conn:
         conn.execute("""
             UPDATE bookings SET status=?, cancellation_json=?, error=?, updated_at=CURRENT_TIMESTAMP
@@ -226,16 +195,27 @@ def get_booking(run_id: str):
     return _decode_booking(row) if row else None
 
 
-def list_bookings(user_id: str) -> list[dict]:
-    """Every booking this browser has ever submitted, most recent first --
-    the booking-history view, and how a booking made days ago can still be
-    found and cancelled: its run_id no longer needs to be the one remembered
-    in localStorage, since this lists all of them by user_id instead. No
-    pagination or row cap -- a single local SQLite file isn't going to
-    accumulate enough rows from one browser to need it."""
+def list_upcoming(user_id: str, now: "datetime | None" = None) -> list[dict]:
+    """This browser's bookings that are still on the books ('succeeded', or
+    'cancel_failed' because the cancel did not go through) and start in the
+    future, soonest first."""
+    now = now or datetime.now()
     conn = get_conn()
     rows = conn.execute(
-        "SELECT * FROM bookings WHERE user_id = ? ORDER BY updated_at DESC", (user_id,)
+        "SELECT * FROM bookings WHERE user_id = ? AND status IN ('succeeded', 'cancel_failed')",
+        (user_id,),
     ).fetchall()
     conn.close()
-    return [_decode_booking(row) for row in rows]
+
+    upcoming = []
+    for row in rows:
+        booking = _decode_booking(row)
+        slot = (booking["result"] or {}).get("appointment_slot") or {}
+        try:
+            starts = datetime.fromisoformat(f"{slot['date']}T{slot['time']}")
+        except (KeyError, ValueError):
+            continue  # no readable slot: nothing to sort or show it by
+        if starts >= now:
+            upcoming.append((starts, booking))
+    upcoming.sort(key=lambda pair: pair[0])
+    return [booking for _, booking in upcoming]

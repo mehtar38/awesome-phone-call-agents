@@ -1,12 +1,5 @@
-/* Design system for the booking app.
-   Direction: refined clinical warmth -- calm, trustworthy, unhurried. Warm
-   paper background instead of clinical white/blue, a deep pine primary with
-   a terracotta accent reserved for selection states, a wonky/characterful
-   display serif for headings paired with a plain humanist sans for body
-   text and controls. No emoji anywhere -- icons are hand-drawn inline SVG
-   so they inherit color and sit inside consistent icon "chips". Every
-   interactive element stays large enough to hit reliably on a phone, since
-   this is meant to be usable without reading much. */
+/* Warm paper background, deep pine primary, terracotta accent for selection.
+   Controls are large enough to hit reliably on a phone. */
 
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Public+Sans:wght@400;500;600;700&display=swap');
 
@@ -23,8 +16,6 @@
   --primary-tint: #e3ebe3;
   --accent: #b5502e;
   --accent-tint: #f6e5d9;
-  --success: #2f4a3c;
-  --success-tint: #e3ebe3;
   --danger: #a8402c;
   --danger-tint: #f8e6e1;
   --radius-lg: 18px;
@@ -345,7 +336,6 @@ canvas#captureCanvas { display: none; }
 }
 .banner.show { display: block; }
 .banner.error { background: var(--danger-tint); color: var(--danger); border-left-color: var(--danger); }
-.banner.success { background: var(--success-tint); color: var(--success); border-left-color: var(--success); }
 
 /* ---------- confirmation screen ---------- */
 .confirm-icon {

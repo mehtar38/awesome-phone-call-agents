@@ -1,33 +1,24 @@
 """
 Step 3A: the family tier.
 
-Family is a definite, pre-registered, ORDERED list, reached by phone ONLY (no
-share link, no channel preference, no urgency branching), and checked AFTER a
-clinic and its matched slots already exist -- not before. Each member is called
-one at a time, in list order, and asked which of those already-matched slots
-they can cover; the first one who can cover any of them is locked in and nobody
-further is called. Once the appointment is actually booked, whoever was
-secured gets a confirmation text (Step 4) -- the call-only rule governs how
-they are SECURED, not whether they're told the outcome.
+The user's registered family members are phoned one at a time, in list order,
+after a clinic and its matched slots exist. Each is asked which of those
+slots they can cover; the first who can is locked in and nobody further is
+called. Family is reached by phone only.
 
-This lives in its own module rather than in reminders.py because it IS a
-CALL-E call. reminders.py is for the non-CALL-E side channels.
-
-Step 5 adds a second family call: `confirm_family_member()`, the binding ask
-placed after the clinic is actually booked. A "yes" from call_family_in_order
-above was given to a slot that wasn't booked yet; this call is what makes it
-real -- it mirrors interpreter_matching.confirm_interpreter() and is asked
-for the same reason.
-
-`release_family_member()` is the reverse of that binding ask: the user
-cancelled an already-booked appointment, so whoever was confirmed to
-interpret it needs to be told it's off -- mirrors
-interpreter_matching.send_release(). See appointment.cancel_appointment().
+After the clinic is booked, `confirm_family_member()` places the binding ask
+(the earlier "yes" was to a slot not yet booked). If the user cancels later,
+`release_family_member()` tells whoever was confirmed that it is off.
 """
 
 from ..calle.run import CallPurpose, call_and_wait
 
 from .types import ClinicCandidate, ClinicSlot, FamilyInterpreter, UserInput, append_note
+
+_NOTES_FIELD = {
+    "type": "string",
+    "description": "Any concern or condition they raised. Empty if none.",
+}
 
 FAMILY_SLOT_SCHEMA = {
     "type": "object",
@@ -36,22 +27,16 @@ FAMILY_SLOT_SCHEMA = {
             "type": "array",
             "items": {"type": "string", "description": "YYYY-MM-DD HH:MM"},
         },
-        "additional_notes": {
-            "type": "string",
-            "description": "Any concern or condition they raised. Empty if none.",
-        },
+        "additional_notes": _NOTES_FIELD,
     },
-}
-
-_NOTES_FIELD = {
-    "type": "string",
-    "description": "Any concern or condition they raised. Empty if none.",
 }
 
 FAMILY_CONFIRM_SCHEMA = {
     "type": "object",
     "properties": {"confirmed": {"type": "boolean"}, "additional_notes": _NOTES_FIELD},
 }
+
+FAMILY_RELEASE_SCHEMA = {"type": "object", "properties": {"additional_notes": _NOTES_FIELD}}
 
 
 def call_family_in_order(
@@ -60,30 +45,18 @@ def call_family_in_order(
     user: UserInput,
     clinic: ClinicCandidate,
 ) -> "tuple[FamilyInterpreter | None, ClinicSlot | None]":
-    """
-    Returns the first member who can cover a matched slot, together with the
-    slot they're locked in for (the first matched slot they named, in the
-    clinic's own slot order). Returns (None, None) if the whole list is
-    exhausted with no match -- the caller then moves on to freelance
-    sourcing.
-
-    Every registered member is eligible: the appointment-sensitivity gate
-    that used to decide whether family could be considered at all is gone
-    from this build. Whether family is used is the user's call, expressed by
-    who they register and by has_interpreter.
-
-    Gives the clinic's name and location -- unlike the freelance availability
-    ask, there's no reason to withhold it here, since family already knows
-    who the patient is, and knowing where they'd need to be helps them judge
-    whether they can actually make it.
-    """
+    """The first member who can cover a matched slot, with the first matched
+    slot they named (in the clinic's own order); (None, None) if nobody can.
+    Family is told the clinic's name and location: they already know who the
+    patient is, and need the location to judge whether they can make it."""
     if not matched_slots:
         return None, None
     slot_keys = [s.key() for s in matched_slots]
     for position, member in enumerate(family):
         task = (
-            f"Ask if you are speaking with {member.name}. Say that you are calling on "
-            f"behalf of {user.name}, who is deaf or hard of hearing. Ask whether they "
+            f"Start by saying you are an AI agent calling on behalf of {user.name}, "
+            f"who is deaf or hard of hearing, and ask if you are speaking with "
+            f"{member.name}. Ask whether they "
             f"are free to interpret at any of these specific appointment "
             f"times: {', '.join(slot_keys)}, at {clinic.name} "
             f"({clinic.location_description()}). Return every one of those "
@@ -97,30 +70,26 @@ def call_family_in_order(
             batch_position=position, purpose=CallPurpose.FAMILY_AVAILABILITY,
         )
         if not result.task_completed:
-            continue  # no answer / declined to engage -- try the next member
+            continue  # no answer: try the next member
         member.notes = append_note(member.notes, result.structured_result.get("additional_notes"))
         raw = result.structured_result.get("coverable_slots") or []
         member.coverable_slots = [s for s in raw if isinstance(s, str)]
         for slot in matched_slots:
             if slot.key() in member.coverable_slots:
-                return member, slot  # locked in; stop calling the list
+                return member, slot
     return None, None
 
 
 def confirm_family_member(
     member: FamilyInterpreter, slot: ClinicSlot, user: UserInput, clinic: ClinicCandidate
 ) -> bool:
-    """The binding ask, made after the clinic is booked -- see the module
-    docstring. Works equally for the member who was locked in during the
-    search (a real follow-up) and for one further down the list who was
-    never reached before (a first, direct ask): either way this is the live
-    yes/no for the exact slot that's now actually booked, so the wording
-    doesn't presuppose they were already called.
-
-    Gives the clinic's name and location, same as the earlier availability
-    ask -- this is the call that tells them whether they actually need to
-    show up, so leaving out where would defeat the point of it."""
+    """The binding ask, made after the clinic is booked: a live yes/no for the
+    exact slot. Works for the member locked in during the search and for one
+    further down the list who was never reached, so the wording doesn't assume
+    an earlier call. Includes the location, since this call tells them whether
+    they need to show up."""
     task = (
+        f"Start by saying you are an AI agent calling on behalf of {user.name}. "
         f"Tell {member.name} that {user.name}'s appointment has been booked "
         f"for {slot.date} {slot.time} at {clinic.name} "
         f"({clinic.location_description()}), and ask whether they can "
@@ -133,9 +102,6 @@ def confirm_family_member(
     return bool(result.structured_result.get("confirmed", False))
 
 
-FAMILY_RELEASE_SCHEMA = {"type": "object", "properties": {"additional_notes": _NOTES_FIELD}}
-
-
 def release_family_member(
     member: FamilyInterpreter,
     patient_name: str,
@@ -143,10 +109,10 @@ def release_family_member(
     slot: ClinicSlot,
     reason: str,
 ) -> None:
-    """Tells an already-confirmed family member the appointment is off. Not
-    an ask -- there's nothing to decide, only something to be told -- so
-    unlike every other family call there's no yes/no to return."""
+    """Tells a confirmed family member the appointment is off. There is
+    nothing to decide, only to be told, so nothing is returned."""
     task = (
+        f"Start by saying you are an AI agent calling on behalf of {patient_name}. "
         f"Tell {member.name} that {patient_name}'s appointment for "
         f"{slot.date} {slot.time} at {clinic.name} ({clinic.location_description()}) "
         f"has been cancelled: {reason}. They do not need to interpret for it."

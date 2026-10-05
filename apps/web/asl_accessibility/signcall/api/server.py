@@ -1,61 +1,46 @@
 """
-The endpoint the frontend POSTs to.
+The HTTP API the frontend talks to.
 
     POST /runs               -> 202 {run_id, status, mock_mode, plan}
     GET  /runs/{id}          -> {status, proposal, result | error | reason, plan,
                                  started_at, finished_at}
     POST /runs/{id}/confirm  -> the user's answer: {"approved": true | false}
-    POST /runs/{id}/cancel   -> 202, cancels an already-succeeded booking.
-                                Body optional: {"result": {...}, "patient_name": "..."}
-                                supplies the booking's own details when this
-                                process no longer remembers the run (see below).
-    GET  /health             -> {mock_mode, real_calls_allowed, credentials present}
+    POST /runs/{id}/cancel   -> 202; cancels an already-succeeded booking.
+                                Optional body {"result": {...}, "patient_name": "..."}
+                                supplies the booking's own details when this process
+                                no longer remembers the run.
+    GET  /health             -> mode flags and whether credentials are present
 
-A run's status is running -> awaiting_confirmation -> running -> one of
-succeeded | declined | failed. A succeeded run can move on once more, only on
-the user's own request: succeeded -> cancelling -> cancelled | cancel_failed.
+A run's status goes running -> awaiting_confirmation -> running -> one of
+succeeded | declined | failed. A succeeded run can move on once more, only at
+the user's request: succeeded -> cancelling -> cancelled | cancel_failed.
 
-This server keeps NO durable storage of its own -- `_runs` below is a plain
-in-memory dict, gone the moment the process restarts. That's fine for a run
-still in progress (the frontend polls the SAME process that's running it),
-but a cancel request can arrive long after -- the frontend's own database
-outlives this process by design. So POST .../cancel's body is optional
-exactly so a "forgotten" run (this process never ran it, or was restarted
-since) can still be cancelled: the caller supplies the booking's own
-`result` and `patient_name` (which the frontend already has stored), and
-this server "adopts" the run from that rather than requiring its own memory
-to still hold it. See cancel_run() below.
+Design:
 
-Shape of the contract, and why:
-
-  - The POST body is exactly the object schemas/user_input.schema.json
-    defines. It is validated SYNCHRONOUSLY, so a malformed profile comes back
-    as 400 with the validator's own message and not one call is placed. That
-    fail-fast property is the reason the schema exists.
-  - A real run places roughly fifteen phone calls and takes many minutes, so
-    an accepted run is handed to a background thread and the caller polls.
-    Holding an HTTP connection open across that would time out in any browser.
-  - Submission consents to the SEARCH: the plan text returned by POST is
-    workflow/appointment.py::describe_goal(), including what each kind of call
-    shares. Nothing is BOOKED until a second answer: once a clinic slot and an
-    interpreter are lined up, the run pauses in awaiting_confirmation with a
-    `proposal`, tells the user (api/notify.py), and waits for POST .../confirm.
+  - The POST body is the object schemas/user_input.schema.json defines. It is
+    validated synchronously, so a malformed profile gets a 400 with the
+    validator's message and no call is placed.
+  - A run places many calls over several minutes, so it runs on a background
+    thread and the caller polls.
+  - Submitting consents to the search. Nothing is booked until a second
+    answer: once a clinic slot and an interpreter are lined up the run pauses
+    in awaiting_confirmation with a `proposal`, and waits for POST .../confirm.
     No answer within SIGNCALL_CONFIRM_TIMEOUT_SECONDS (default 900) counts as
-    "no", and the run ends as declined.
+    "no" and the run ends as declined.
+  - This server keeps no durable storage. `_runs` is an in-memory dict that
+    disappears on restart, while the frontend's database outlives it, so
+    POST .../cancel accepts the booking's stored `result` and "adopts" a run
+    this process has forgotten.
 
-Run it (from apps/web/asl_accessibility/, never from .../signcall/ itself --
-see README's naming-collision note):
+Run it from the directory above signcall/ (see the README), never with
+--workers > 1 or --reload: the run lock, the run registry and the real-mode
+line assignments are per-process.
 
     CALLE_MOCK_MODE=1 SIGNCALL_API_DEMO_MOCKS=1 \\
-        uvicorn signcall.api.server:app --host 127.0.0.1 --port 8000
-
-Do NOT pass --workers >1 or --reload: the one-run-at-a-time lock, the run
-registry and calle/run.py's line-assignment map are per-process, so a second
-worker would happily start a concurrent run dialling the same three lines.
+        uvicorn signcall.api.server:app --host 127.0.0.1 --port 8001
 """
 
 from __future__ import annotations
-
 
 import dataclasses
 import os
@@ -69,9 +54,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictBool
 
 from ..calle import MOCK_MODE
-from ..calle.run import clear_default_mock, register_default_mock
+from ..calle.run import TEST_LINES_ENV, clear_default_mock, register_default_mock
 from ..workflow.appointment import cancel_appointment, describe_goal, run_interpreter_mesh
-from ..workflow.confirmation import ApprovalFn, BookingDeclined, BookingProposal
+from ..workflow.confirmation import ApprovalFn, BookingDeclined, BookingProposal, NoMatchFound
 from ..workflow.types import UserInput
 from ..workflow.user_input import UserInputError, load_user_input
 from . import demo_mocks, notify
@@ -80,8 +65,8 @@ ALLOW_REAL_CALLS = os.environ.get("SIGNCALL_API_ALLOW_REAL_CALLS") == "1"
 USE_DEMO_MOCKS = os.environ.get("SIGNCALL_API_DEMO_MOCKS") == "1"
 CONFIRM_TIMEOUT_SECONDS = float(os.environ.get("SIGNCALL_CONFIRM_TIMEOUT_SECONDS", "900"))
 
-# CORS is NOT a security boundary here -- see the README. It stops another
-# site's JavaScript reading responses; it stops nothing from POSTing.
+# CORS only stops another site's JavaScript from reading responses. It is not a
+# security boundary: it does not stop anything from POSTing.
 LOCALHOST_ORIGIN_REGEX = r"http://(localhost|127\.0\.0\.1)(:\d+)?"
 
 app = FastAPI(
@@ -96,13 +81,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# One run at a time. Beyond politeness: calle/run.py's line-assignment map and
-# mock registry are module-level globals, and run_interpreter_mesh() clears the
-# former at the start of every run -- so two overlapping runs would erase each
-# other's test-line assignments, and the booking call (which relies on a sticky
-# assignment made during the clinic search) would fail after the user had
-# approved it. The lock is what stands between them, and it is held while a
-# run waits for the user's answer.
+# One run at a time. The real-mode line assignments and the mock registry are
+# module-level state that every run resets, so overlapping runs would erase each
+# other's assignments and a booking call could fail after the user approved it.
+# The lock is held while a run waits for the user's answer.
 _run_lock = threading.Lock()
 _runs: dict[str, dict] = {}
 _runs_guard = threading.Lock()
@@ -112,7 +94,7 @@ _active_run_id: str | None = None
 @dataclasses.dataclass
 class _Decision:
     """The user's answer to a pending confirmation, handed from the request
-    thread that received it to the run thread that is waiting on it."""
+    thread that received it to the run thread waiting on it."""
 
     answered: threading.Event = dataclasses.field(default_factory=threading.Event)
     approved: bool = False
@@ -126,31 +108,33 @@ class ConfirmRequest(BaseModel):
 
 
 class CancelRequest(BaseModel):
-    """Optional -- only needed when this process doesn't already have the
-    run in memory. `result` is exactly the dict a succeeded run's `result`
-    field already is (dataclasses.asdict(AppointmentResult)); the frontend
-    already has it stored verbatim, so this is a pass-through, not a new
-    shape to build."""
+    """Only needed when this process doesn't already have the run in memory.
+    `result` is the dict a succeeded run's `result` field already is."""
 
     result: dict | None = None
     patient_name: str | None = None
 
 
 def _assert_mode_is_deliberate() -> None:
-    """Refuse to serve in real-call mode unless somebody said so twice.
-
-    CALLE_MOCK_MODE defaults to 0 and .env carries a working CALLE_API_KEY, so
-    a bare `uvicorn signcall.api.server:app` would otherwise come up ready to
-    place real phone calls -- and since submission is the consent, a single
-    POST from an open browser tab would spend them with no further click."""
-    if MOCK_MODE or ALLOW_REAL_CALLS:
+    """Refuse to serve in real-call mode unless it was asked for explicitly and
+    the phones to ring are configured. Submitting is the consent, so a single
+    POST to a server that came up in real mode by accident would start placing
+    real calls."""
+    if MOCK_MODE:
         return
-    raise RuntimeError(
-        "Refusing to start: this would serve in REAL-CALL mode, where one POST "
-        "places around fifteen real phone calls with no further confirmation. "
-        "Set CALLE_MOCK_MODE=1 to serve safely, or set "
-        "SIGNCALL_API_ALLOW_REAL_CALLS=1 to say you meant it."
-    )
+    if not ALLOW_REAL_CALLS:
+        raise RuntimeError(
+            "Refusing to start: this would serve in REAL-CALL mode, where one POST "
+            "places real phone calls with no further confirmation. Set "
+            "CALLE_MOCK_MODE=1 to serve safely, or SIGNCALL_API_ALLOW_REAL_CALLS=1 "
+            "to say you meant it."
+        )
+    if not os.environ.get(TEST_LINES_ENV):
+        raise RuntimeError(
+            f"Refusing to start in real-call mode: {TEST_LINES_ENV} is not set. Clinic "
+            f"and interpreter calls are only placed to phones you own; set it to one "
+            f"or more comma-separated E.164 numbers."
+        )
 
 
 _assert_mode_is_deliberate()
@@ -179,8 +163,8 @@ def _finish(run_id: str, **fields) -> None:
 
 
 def _approver(run_id: str) -> ApprovalFn:
-    """The approval callback for one run: publish the proposal, tell the user,
-    and hold the run thread until they answer or the timeout passes."""
+    """The approval callback for one run: publish the proposal, notify the
+    frontend, and hold the run thread until the user answers or time runs out."""
 
     def approve(proposal: BookingProposal) -> bool:
         decision = _Decision()
@@ -195,8 +179,8 @@ def _approver(run_id: str) -> ApprovalFn:
         decision.answered.wait(timeout=CONFIRM_TIMEOUT_SECONDS)
         with _runs_guard:
             _decisions.pop(run_id, None)
-            # An answer can land between the wait timing out and this lock;
-            # it was set under the same lock, so it is visible here.
+            # An answer can land between the wait timing out and taking this
+            # lock; it is set under the same lock, so it is visible here.
             answered = decision.answered.is_set()
         if not answered:
             raise BookingDeclined(
@@ -209,15 +193,15 @@ def _approver(run_id: str) -> ApprovalFn:
 
 
 def _execute(run_id: str, user: UserInput, gate: "threading.Event | None") -> None:
-    """The background worker. Everything the workflow can raise is recorded as
-    a failed run rather than escaping -- the HTTP response was sent long ago,
-    so an uncaught exception here would simply vanish."""
+    """The background worker. Anything the workflow raises is recorded as a
+    failed run; the HTTP response is long gone, so an uncaught exception here
+    would vanish."""
     global _active_run_id
     try:
         if USE_DEMO_MOCKS:
             register_default_mock(demo_mocks.build_resolver(user, gate))
         result = run_interpreter_mesh(user, approve=_approver(run_id))
-    except BookingDeclined as exc:
+    except (BookingDeclined, NoMatchFound) as exc:
         _finish(run_id, status="declined", reason=str(exc))
     except Exception as exc:
         # Some exceptions (a timeout, for one) have an empty message.
@@ -229,8 +213,7 @@ def _execute(run_id: str, user: UserInput, gate: "threading.Event | None") -> No
         if USE_DEMO_MOCKS:
             clear_default_mock()
         _active_run_id = None
-        _run_lock.release()  # in finally, so a raising run can never wedge
-                              # the server at 409 forever
+        _run_lock.release()  # in finally so a raising run can never leave the server at 409
 
 
 @app.get("/health")
@@ -240,10 +223,12 @@ def health() -> dict:
         "mock_mode": MOCK_MODE,
         "real_calls_allowed": ALLOW_REAL_CALLS and not MOCK_MODE,
         "demo_mocks": USE_DEMO_MOCKS,
-        "notify_url_configured": bool(os.environ.get("SIGNCALL_NOTIFY_URL")),        "confirm_timeout_seconds": CONFIRM_TIMEOUT_SECONDS,
-        # Presence only -- never the values.
+        "notify_url_configured": bool(os.environ.get("SIGNCALL_NOTIFY_URL")),
+        "confirm_timeout_seconds": CONFIRM_TIMEOUT_SECONDS,
+        # Presence only, never the values.
         "calle_api_key_present": bool(os.environ.get("CALLE_API_KEY")),
         "apify_api_token_present": bool(os.environ.get("APIFY_API_TOKEN")),
+        "test_lines_configured": bool(os.environ.get(TEST_LINES_ENV)),
         "active_run_id": _active_run_id,
     }
 
@@ -259,8 +244,7 @@ async def start_run(request: Request) -> JSONResponse:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
 
-    # Synchronous on purpose: a malformed profile must be rejected before
-    # anything is accepted, let alone dialled.
+    # Validated before anything is accepted, let alone dialled.
     try:
         user = load_user_input(payload)
     except UserInputError as exc:
@@ -272,7 +256,7 @@ async def start_run(request: Request) -> JSONResponse:
             detail=(
                 f"A run is already in progress (run_id={_active_run_id}). This "
                 f"service handles one run at a time, because concurrent runs "
-                f"would place overlapping real phone calls and corrupt each "
+                f"would place overlapping phone calls and corrupt each "
                 f"other's call routing."
             ),
         )
@@ -285,10 +269,8 @@ async def start_run(request: Request) -> JSONResponse:
             "mock_mode": MOCK_MODE, "started_at": _now(), "finished_at": None,
             "proposal": None, "result": None, "error": None, "error_type": None,
             "reason": None, "cancellation": None,
-            # Leading underscore = never returned by get_run() (see there) --
-            # this is PII with no reason to leave the process, kept only so a
-            # later cancel_appointment() call has the patient's name without
-            # needing this UserInput object to still exist.
+            # Keys starting with "_" are never returned by get_run(). The name is
+            # kept so a later cancel has the patient's name without the UserInput.
             "_patient_name": user.name,
         }
     _active_run_id = run_id
@@ -296,9 +278,8 @@ async def start_run(request: Request) -> JSONResponse:
     gate = _pending_gate.pop(0) if _pending_gate else None
     threading.Thread(
         target=_execute, args=(run_id, user, gate), name=f"signcall-run-{run_id[:8]}",
-        daemon=False,  # a SIGINT mid-run must not kill the process inside the
-                       # window where an interpreter has confirmed but the
-                       # clinic isn't booked yet
+        daemon=False,  # a SIGINT mid-run must not kill the process between an
+                       # interpreter confirming and the clinic being booked
     ).start()
 
     return JSONResponse(
@@ -313,18 +294,15 @@ def get_run(run_id: str) -> dict:
         run = _runs.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"No run with id {run_id}.")
-    # Leading-underscore keys are internal bookkeeping (see start_run()) --
-    # never returned, on principle: nothing is exposed here that isn't meant
-    # to leave the process, and a run_id alone is the only "auth" this
-    # endpoint has.
+    # Keys starting with "_" are internal bookkeeping and never leave the process.
     return {key: value for key, value in run.items() if not key.startswith("_")}
 
 
 @app.post("/runs/{run_id}/confirm")
 def confirm_run(run_id: str, body: ConfirmRequest) -> dict:
-    """The user's answer to a run that is awaiting_confirmation. Answering an
-    unknown run is 404; answering one that isn't waiting (already answered,
-    timed out, or finished) is 409, so a double-click can't decide twice."""
+    """The user's answer to a run that is awaiting_confirmation. An unknown run
+    is 404; one that isn't waiting (already answered, timed out or finished) is
+    409, so a double click can't decide twice."""
     with _runs_guard:
         run = _runs.get(run_id)
         if run is None:
@@ -342,20 +320,11 @@ def confirm_run(run_id: str, body: ConfirmRequest) -> dict:
 
 
 def _execute_cancel(run_id: str) -> None:
-    """The background worker for a cancel request -- mirrors _execute()
-    above: cancel_appointment() places real calls (clinic, then whoever was
-    interpreting), so this runs off the request thread the same way the
-    original booking run did, and the lock it holds is the SAME one, for the
-    SAME reason -- a cancellation places calls through the same real-mode
-    routing/dial-lock machinery a fresh POST /runs would, and the two must
-    never overlap."""
+    """The background worker for a cancel request. It places real calls, so it
+    runs off the request thread and under the same lock as a booking run."""
     global _active_run_id
     try:
         if USE_DEMO_MOCKS:
-            # A fresh, simpler resolver, not a reuse of the original run's --
-            # that one was already cleared in _execute()'s finally block once
-            # this run succeeded, and it closed over a UserInput this run may
-            # not have anymore anyway (see demo_mocks.build_cancel_resolver()).
             register_default_mock(demo_mocks.build_cancel_resolver())
         with _runs_guard:
             result = _runs[run_id]["result"]
@@ -380,25 +349,20 @@ def _execute_cancel(run_id: str) -> None:
         if USE_DEMO_MOCKS:
             clear_default_mock()
         _active_run_id = None
-        _run_lock.release()  # in finally, for the same reason as _execute()'s
+        _run_lock.release()
 
 
 @app.post("/runs/{run_id}/cancel", status_code=202)
 def cancel_run(run_id: str, body: CancelRequest | None = Body(default=None)) -> JSONResponse:
-    """Cancels an already-succeeded booking: calls the clinic to cancel,
-    then releases whoever was lined up to interpret it. Valid from
-    `succeeded`, and retriable from `cancel_failed` (nothing about a failed
-    cancel attempt un-books the appointment, so trying again is exactly
-    what should happen) -- refused from any other status, and refused while
-    a cancellation is already in flight, the same way a second confirm
-    answer is.
+    """Cancels an already-succeeded booking: calls the clinic, then releases
+    whoever was lined up to interpret it. Valid from `succeeded`, and
+    retriable from `cancel_failed`. Refused from any other status and while a
+    cancellation is already in flight.
 
-    Stateless-friendly (see the module docstring): if this process has no
-    memory of the run at all, `body.result` + `body.patient_name` let it
-    "adopt" the run as if it had just succeeded, rather than 404ing outright.
-    If it DOES remember the run, a supplied body is still preferred over
-    this process's own copy -- the frontend's is the durable one; this
-    process's is only ever a cache of what it saw at the time."""
+    If this process has no memory of the run, `body.result` and
+    `body.patient_name` let it adopt the run instead of returning 404. If it
+    does remember the run, a supplied body still wins: the frontend's copy is
+    the durable one."""
     global _active_run_id
 
     with _runs_guard:
@@ -410,7 +374,7 @@ def cancel_run(run_id: str, body: CancelRequest | None = Body(default=None)) -> 
                     detail=(
                         f"No run with id {run_id}, and no booking details were "
                         f"supplied to cancel it with. This server keeps no "
-                        f"memory of a run across a restart -- pass `result` and "
+                        f"memory of a run across a restart; pass `result` and "
                         f"`patient_name` from your own stored record."
                     ),
                 )
@@ -436,7 +400,7 @@ def cancel_run(run_id: str, body: CancelRequest | None = Body(default=None)) -> 
             status_code=409,
             detail=(
                 f"A run is already in progress (run_id={_active_run_id}). "
-                f"Cancellation places real calls through the same routing as "
+                f"Cancellation places calls through the same routing as "
                 f"a booking run, so it has to wait its turn too."
             ),
         )
@@ -453,7 +417,6 @@ def cancel_run(run_id: str, body: CancelRequest | None = Body(default=None)) -> 
     return JSONResponse(status_code=202, content={"run_id": run_id, "status": "cancelling"})
 
 
-# Test-only hook: the harness pushes a threading.Event here to hold the next
-# run open long enough to prove a concurrent POST is refused. Empty in normal
-# operation, so it costs nothing.
+# Test-only hook: the harness pushes an Event here to hold the next run open
+# long enough to show that a concurrent POST is refused. Empty in normal use.
 _pending_gate: list = []
